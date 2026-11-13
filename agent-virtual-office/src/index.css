@@ -1,0 +1,214 @@
+@import "tailwindcss" source(none);
+
+@source "./";
+@source "../index.html";
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+}
+
+/* #14 weather animation keyframes. Defined here (not in an inline <style>
+   tag inside the SVG) so strict CSP environments — corporate intranets
+   with `style-src 'self'` and no `'unsafe-inline'` — bundle these via
+   Vite into the regular `<link rel="stylesheet">` chain and allow them.
+   The lightning-flash keyframe caps opacity at 0.35 and fires twice per
+   5s cycle to stay well clear of photosensitive seizure thresholds. */
+@keyframes weather-raindrop-fall {
+  0%   { transform: translateY(-100%); opacity: 0; }
+  15%  { opacity: 0.7; }
+  85%  { opacity: 0.7; }
+  100% { transform: translateY(100%); opacity: 0; }
+}
+@keyframes weather-cloud-drift {
+  0%   { transform: translateX(-30%); }
+  100% { transform: translateX(30%); }
+}
+@keyframes weather-lightning-flash {
+  0%, 88%, 100% { opacity: 0; }
+  90%           { opacity: 0.35; }
+  92%           { opacity: 0; }
+  94%           { opacity: 0.20; }
+  96%           { opacity: 0; }
+}
+/* Team-chat "typing…" indicator: three dots pulse in a wave. Subtle (opacity only),
+   no transform, so it stays calm but alive. Staggered per-dot via animation-delay. */
+@keyframes chat-typing {
+  0%, 70%, 100% { opacity: 0.25; }
+  35%           { opacity: 1; }
+}
+/* Activity-feed new-item entrance (COMMS Phase 3): a single gentle fade + tiny rise, ~250ms, ONCE.
+   Per the calm-tech motion contract — fade OR slide (not both hard), no flash, settles to static.
+   Applied only when reducedMotion is off; new rows animate because React mounts them on a new key. */
+@keyframes chat-feed-in {
+  0%   { opacity: 0; transform: translateY(-3px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+/* Office pet (#39): a slow rising "z" while napping, and a tiny excited bob. Both are gated off
+   when reducedMotion is on (the style prop is simply not applied). Calm cadence by design. */
+@keyframes pet-snooze {
+  0%, 100% { opacity: 0.2; transform: translateY(0); }
+  50%      { opacity: 0.8; transform: translateY(-2px); }
+}
+@keyframes pet-bob {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-1.5px); }
+}
+/* Larger bob for the dog's livelier motion grammar (#39 types). */
+@keyframes pet-bob-lg {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-2.5px); }
+}
+/* Office pet: a squash-stretch "pop" on each mode change (keyed remount) so honest state changes are
+   FELT, not just faded. reducedMotion skips it (instant swap). transform-origin is the sprite's local
+   origin (feet), so it pops up in place. */
+@keyframes pet-pop {
+  0%   { opacity: 0; transform: scale(0.8); }
+  60%  { opacity: 1; transform: scale(1.07); }
+  100% { opacity: 1; transform: scale(1); }
+}
+/* #39 delight: celebrate confetti — a ✦ rises and fades off the pet on a real deploy/eureka. */
+@keyframes pet-confetti {
+  0%   { opacity: 0; transform: translateY(2px); }
+  20%  { opacity: 0.95; }
+  100% { opacity: 0; transform: translateY(-11px); }
+}
+/* #39 delight: click-to-pet ♥ floats up and fades. */
+@keyframes pet-heart {
+  0%   { opacity: 0; transform: translateY(2px) scale(0.7); }
+  25%  { opacity: 1; transform: translateY(-1px) scale(1); }
+  100% { opacity: 0; transform: translateY(-9px) scale(1); }
+}
+/* AVO-136 event juice (bundled here, CSP-safe — no inline <style>). One-shot only; reduced-motion
+   never mounts these (gated in JS), so no media-query needed. */
+/* Deploy-success: a ✦ particle rises, drifts, and fades — a brief office-wide celebration burst. */
+@keyframes office-confetti {
+  0%   { opacity: 0; transform: translateY(4px) scale(0.6); }
+  18%  { opacity: 1; }
+  100% { opacity: 0; transform: translateY(-26px) scale(1); }
+}
+/* Eureka: a ✦ sparkle pops near the whiteboard then fades. */
+@keyframes office-sparkle {
+  0%   { opacity: 0; transform: scale(0.4); }
+  40%  { opacity: 1; transform: scale(1.15); }
+  100% { opacity: 0; transform: scale(0.9); }
+}
+/* (desk-slam jitter is done in SVG via <animateTransform additive="sum"> in AgentCharacter — it must
+   COMPOSE with the sprite's translate/scale, which a CSS transform animation would override.) */
+
+/* AVO-193: the coffee machine's reply to a click it cannot serve. Keyframes live here, not in a
+   SMIL <animate>, because an <animate begin="0s"> mounted after page load counts from document
+   start and is already at its end state (measured) — and CSP forbids an inline <style> (#27). */
+@keyframes coffee-steam {
+  0% { opacity: 0; transform: translateY(0); }
+  35% { opacity: 0.9; }
+  100% { opacity: 0; transform: translateY(-6px); }
+}
+@keyframes cozy-plant-sway {
+  0%, 100% { transform: rotate(0deg); }
+  25% { transform: rotate(-10deg); }
+  60% { transform: rotate(8deg); }
+}
+@keyframes cozy-pet-tail {
+  0%, 100% { transform: rotate(0deg); }
+  25%, 65% { transform: rotate(14deg); }
+  45%, 85% { transform: rotate(-14deg); }
+}
+@keyframes cozy-vacuum-brush {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+/* SVG focus gets a heavy browser outline even after pointer clicks. Keep our
+   lighter indicator for keyboard navigation, without framing clicked scene art. */
+[data-cozy-plant]:focus,
+[data-office-pet][role="button"]:focus,
+[data-agent-id][role="button"]:focus {
+  outline: none;
+}
+[data-cozy-plant]:focus-visible,
+[data-office-pet][role="button"]:focus-visible,
+[data-agent-id][role="button"]:focus-visible {
+  outline: 2px solid #B87C31;
+  outline-offset: 2px;
+}
+[data-cozy-plant]:hover [data-cozy-leaves] { filter: brightness(1.2); }
+
+/* In-world props keep their world anchors; feedback transforms only their art. */
+[data-scene-cozy] { cursor: pointer; }
+[data-scene-cozy]:focus { outline: none; }
+[data-scene-cozy-hint] { opacity: 0; }
+[data-scene-cozy]:hover [data-scene-cozy-hint],
+[data-scene-cozy]:focus-visible [data-scene-cozy-hint] { opacity: 1; }
+.cozy-postcard-paper { transform-origin: 0 -9px; transition: transform 140ms ease-out; }
+[data-scene-cozy="postcard"]:hover .cozy-postcard-paper,
+[data-scene-cozy="postcard"]:focus-visible .cozy-postcard-paper {
+  transform: translateY(-2px) rotate(-6deg);
+  filter: drop-shadow(0 1px 1px #755A3E);
+}
+@keyframes cozy-star-short {
+  0% { transform: scale(1.05, .88); }
+  50% { transform: scale(.98, 1.07); }
+  100% { transform: scale(1); }
+}
+@keyframes cozy-star-medium {
+  0% { transform: scale(1.14, .64); }
+  38% { transform: scale(.9, 1.2) rotate(-8deg); }
+  68% { transform: scale(1.04, .96) rotate(3deg); }
+  100% { transform: scale(1) rotate(0); }
+}
+@keyframes cozy-star-long {
+  0% { transform: scale(1.24, .45); }
+  32% { transform: translateY(-9px) scale(.8, 1.38) rotate(-12deg); }
+  58% { transform: translateY(0) scale(1.16, .8) rotate(8deg); }
+  78% { transform: translateY(-2px) scale(.96, 1.1) rotate(-4deg); }
+  100% { transform: translateY(0) scale(1) rotate(0); }
+}
+@keyframes cozy-card-lift {
+  from { opacity: .6; transform: translateY(12px) scale(.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cozy-postcard-paper { transition: none; }
+  [data-scene-cozy="postcard"]:hover .cozy-postcard-paper,
+  [data-scene-cozy="postcard"]:focus-visible .cozy-postcard-paper { transform: none; }
+}
+
+/* Phase-1 Pixel appearance: restrained 1-local-unit bob, mounted ONLY while an actor is
+   really walking (never idle) and never under reduced motion (spec: phased-pixel-character-refresh). */
+@keyframes avo-pixel-walk-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-1px); }
+}
+.avo-pixel-walk-bob { animation: avo-pixel-walk-bob 0.5s steps(1, end) infinite; }
+@media (prefers-reduced-motion: reduce) { .avo-pixel-walk-bob { animation: none; } }
+
+
+/* Decorative dance requested by the user; agent status stays unchanged. */
+@keyframes office-team-dance {
+  0%, 100% { rotate: -12deg; translate: -5px 0; }
+  20% { rotate: 5deg; translate: 2px -2px; }
+  45% { rotate: 14deg; translate: 6px 1px; }
+  70% { rotate: -4deg; translate: -1px -1px; }
+  85% { rotate: -9deg; translate: -4px 1px; }
+}
+[data-agent-id] {
+  transform-box: fill-box;
+  transform-origin: center bottom;
+  animation: office-team-dance 3800ms ease-in-out infinite;
+}
+[data-agent-id="arch"], [data-agent-id="qa"], [data-agent-id="ops"], [data-agent-id="designer"] {
+  animation-delay: -1900ms;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-agent-id] { animation: none; }
+}
+
+/* Keep the developer in the user-requested dance during work updates. */
+[data-agent-id="dev"] {
+  animation: office-team-dance 3800ms ease-in-out infinite !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-agent-id="dev"] { animation: none !important; }
+}

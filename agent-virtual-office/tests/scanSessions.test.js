@@ -1,0 +1,827 @@
+/**
+ * Tests for src/server/scanSessions.mjs
+ *
+ * Covers: single-session pass-through, stale/future filtering, dedup,
+ * multi-session merge (C1 deterministic ordering, C2 joined _seq, M3 TTL
+ * constants, M6 mood carry-forward), and getSessionStats.
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+import { scanAndMerge, getSessionStats } from '../src/server/scanSessions.mjs'
+import { normalizePost } from '../src/utils/normalizePost.js'
+import { OBSERVED_ACTIVITY_TTL_MS } from '../src/utils/statusContract.mjs'
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+function tmpDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'scanSessions-'))
+}
+
+function writeSession(dir, file, data) {
+  fs.writeFileSync(path.join(dir, file), JSON.stringify(data))
+}
+
+function freshSeq(offsetMs = 0) {
+  return String(Date.now() + offsetMs)
+}
+
+// ─── stale / future filtering (M3) ────────────────────────────────────────────
+
+describe('stale / future filtering', () => {
+  let dir
+  beforeEach(() => { dir = tmpDir() })
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+
+  it('skips sessions older than 5 minutes', () => {
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: String(Date.now() - 301_000),
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    expect(scanAndMerge(dir, dir)).toBeNull()
+  })
+
+  it('skips sessions more than 5 minutes in the future', () => {
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: String(Date.now() + 301_000),
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    expect(scanAndMerge(dir, dir)).toBeNull()
+  })
+
+  it('accepts sessions within the 5-minute window', () => {
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: freshSeq(),
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    expect(scanAndMerge(dir, dir)).not.toBeNull()
+  })
+
+  it('returns null when directory does not exist', () => {
+    expect(scanAndMerge(path.join(dir, 'nonexistent'), dir)).toBeNull()
+  })
+})
+
+// ─── single session pass-through ──────────────────────────────────────────────
+
+describe('single session pass-through', () => {
+  let dir
+  beforeEach(() => { dir = tmpDir() })
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+
+  it('returns session data without _cwd', () => {
+    const seq = freshSeq()
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: seq, _cwd: dir,
+      agents: [{ role: 'dev', status: 'working', task: 'test', label: null }],
+      workflow: 'build',
+    })
+    const result = scanAndMerge(dir, dir)
+    expect(result).not.toBeNull()
+    expect(result._cwd).toBeUndefined()
+    expect(result._seq).toBe(seq)
+    expect(result.workflow).toBe('build')
+  })
+
+  it('passes through mood and moodDuration in single-session path', () => {
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: freshSeq(), _cwd: dir,
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+      mood: 'smooth', moodDuration: 30000,
+    })
+    const result = scanAndMerge(dir, dir)
+    expect(result.mood).toBe('smooth')
+    expect(result.moodDuration).toBe(30000)
+  })
+})
+
+// ─── dedup: bare file is duplicate of slugged session ─────────────────────────
+
+describe('dedup', () => {
+  let dir
+  beforeEach(() => { dir = tmpDir() })
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+
+  it('removes bare office-status.json when _seq is within 2s of a slugged session (hook source)', () => {
+    const baseSeq = Date.now()
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: String(baseSeq), source: 'claude-cli',
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    writeSession(dir, 'office-status-feat-x.json', {
+      type: 'office-status', _seq: String(baseSeq + 500), _cwd: dir,
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    const result = scanAndMerge(dir, dir)
+    // After dedup, only the slugged session remains → single-session path
+    expect(result).not.toBeNull()
+    expect(result.source).not.toBe('multi-session')
+  })
+
+  it('keeps bare file when source is not claude-cli (POST/API write — not a hook duplicate)', () => {
+    const baseSeq = Date.now()
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: String(baseSeq), source: 'api',
+      agents: [{ role: 'pm', status: 'working', task: null, label: null }],
+    })
+    writeSession(dir, 'office-status-feat-x.json', {
+      type: 'office-status', _seq: String(baseSeq + 100), _cwd: dir,
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    const result = scanAndMerge(dir, dir)
+    // API-sourced bare file is not a hook duplicate — both sessions kept
+    expect(result.source).toBe('multi-session')
+    expect(result.sessionCount).toBe(2)
+  })
+
+  it('keeps bare file when _seq differs by more than 2s', () => {
+    const baseSeq = Date.now()
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: String(baseSeq),
+      agents: [{ role: 'qa', status: 'blocked', task: null, label: null }],
+    })
+    writeSession(dir, 'office-status-feat-x.json', {
+      type: 'office-status', _seq: String(baseSeq + 5000), _cwd: dir,
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    const result = scanAndMerge(dir, dir)
+    expect(result.source).toBe('multi-session')
+    expect(result.sessionCount).toBe(2)
+  })
+})
+
+// ─── multi-session merge ───────────────────────────────────────────────────────
+
+describe('multi-session merge', () => {
+  let dir
+  beforeEach(() => { dir = tmpDir() })
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+
+  function writeSlugged(slug, seq, agents, extra = {}) {
+    writeSession(dir, `office-status-${slug}.json`, {
+      type: 'office-status', _seq: String(seq), _cwd: dir, agents, ...extra,
+    })
+  }
+
+  // C1: deterministic ordering
+  it('C1: merged JSON is identical on repeated calls (same input)', () => {
+    const base = Date.now()
+    writeSlugged('bravo', base + 100, [{ role: 'qa', status: 'blocked', task: null, label: null }])
+    writeSlugged('alpha', base + 200, [{ role: 'dev', status: 'working', task: null, label: null }])
+    const r1 = JSON.stringify(scanAndMerge(dir, dir))
+    const r2 = JSON.stringify(scanAndMerge(dir, dir))
+    expect(r1).toBe(r2)
+  })
+
+  it('C1: agents from sessions sorted by slug appear in slug order', () => {
+    const base = Date.now()
+    writeSlugged('zzz', base + 10, [{ role: 'dev', status: 'working', task: null, label: null }])
+    writeSlugged('aaa', base + 20, [{ role: 'qa', status: 'working', task: null, label: null }])
+    const result = scanAndMerge(dir, dir)
+    expect(result.source).toBe('multi-session')
+    // aaa comes before zzz in sorted order
+    const sessions = result.agents.map(a => a.session)
+    expect(sessions.indexOf('aaa')).toBeLessThan(sessions.indexOf('zzz'))
+  })
+
+  // Defense (server review): a corrupt / old-hook-version / foreign-tool session file with
+  // a truthy NON-ARRAY `agents` value must not throw. It used to crash the server process at
+  // the two unguarded scanAndMerge callers (SSE-connect + file-watch debounce timer) and
+  // blank the whole office at the GET path, because the merge did `(data.agents || []).filter`.
+  it('does not throw when another session file has a non-array agents value (string)', () => {
+    const base = Date.now()
+    writeSlugged('good', base + 100, [{ role: 'dev', status: 'working', task: 'Bash', label: 'x' }])
+    writeSlugged('bad', base + 200, 'oops')  // corrupt: agents is a string, not an array
+    let result
+    expect(() => { result = scanAndMerge(dir, dir) }).not.toThrow()
+    expect(result.source).toBe('multi-session')
+    expect(result.agents.some(a => a.role === 'good~dev')).toBe(true)  // valid session survives
+  })
+
+  it('tolerates non-array agents of various shapes (number, object, boolean)', () => {
+    for (const bad of [42, { not: 'an array' }, true]) {
+      writeSlugged('ok', Date.now() + 100, [{ role: 'qa', status: 'working', task: 'x', label: 'y' }])
+      writeSlugged('corrupt', Date.now() + 200, bad)
+      expect(() => scanAndMerge(dir, dir)).not.toThrow()
+    }
+  })
+
+  it('drops live representatives with invalid roles so they cannot create phantom workflows', () => {
+    const base = Date.now()
+    writeSlugged('bad', base + 100, [{ role: 'hacker', status: 'blocked', task: 'pwn', label: null }], { workflow: 'evil-flow' })
+    writeSlugged('good', base + 200, [{ role: 'dev', status: 'done', task: 'done', label: null }])
+
+    const result = scanAndMerge(dir, dir)
+
+    expect(result.source).toBe('multi-session')
+    expect(result.agents.map(a => a.role)).toEqual(['good~dev'])
+    expect(result.activeCount).toBe(0)
+    expect(result.workflow).toBeNull()
+  })
+
+  it('carries token usage + effort from the most-recent active session (AVO-108/AVO-102)', () => {
+    const base = Date.now()
+    writeSlugged('older', base + 100, [{ role: 'qa', status: 'working', task: 'Read', label: null }],
+      { tokens: { ctx: 100, out: 1, model: 'a' }, effort: 'low' })
+    writeSlugged('newer', base + 500, [{ role: 'dev', status: 'working', task: 'Edit', label: null }],
+      { tokens: { ctx: 650000, out: 1453, model: 'claude-opus-4-8' }, effort: 'high' })
+    const r = scanAndMerge(dir, dir)
+    expect(r.source).toBe('multi-session')
+    expect(r.tokens).toEqual({ ctx: 650000, out: 1453, model: 'claude-opus-4-8' })  // newer wins
+    expect(r.effort).toBe('high')
+  })
+
+  // C2: numeric max _seq
+  it('C2: _seq changes when a session update advances the max', () => {
+    const base = Date.now()
+    writeSlugged('alpha', base + 1000, [{ role: 'dev', status: 'working', task: null, label: null }])
+    writeSlugged('beta', base + 2000, [{ role: 'qa', status: 'working', task: null, label: null }])
+    const r1 = scanAndMerge(dir, dir)
+    const seq1 = r1._seq  // = base+2000
+
+    // Update alpha above beta's seq so the max advances
+    writeSlugged('alpha', base + 2500, [{ role: 'dev', status: 'blocked', task: 'stuck', label: null }])
+    const r2 = scanAndMerge(dir, dir)
+    expect(r2._seq).not.toBe(seq1)
+  })
+
+  it('C2: _seq is the numeric max of child _seqs (passes lastAppliedSeq guard)', () => {
+    const seqA = Date.now()
+    const seqB = seqA + 1000
+    writeSlugged('alpha', seqA, [{ role: 'dev', status: 'working', task: null, label: null }])
+    writeSlugged('beta', seqB, [{ role: 'qa', status: 'working', task: null, label: null }])
+    const result = scanAndMerge(dir, dir)
+    // _seq must be numeric so inferStatus.js lastAppliedSeq guard stays armed
+    expect(result._seq).toBe(String(seqB))
+    expect(/^\d+$/.test(result._seq)).toBe(true)
+  })
+
+  // M3: both functions use same 5-min future tolerance
+  it('M3: session 4 min in future is accepted (within FUTURE_MS)', () => {
+    const seq = Date.now() + 240_000
+    writeSlugged('alpha', seq, [{ role: 'dev', status: 'working', task: null, label: null }])
+    const result = scanAndMerge(dir, dir)
+    expect(result).not.toBeNull()
+  })
+
+  it('M3: session 6 min in future is rejected (beyond FUTURE_MS)', () => {
+    const seq = Date.now() + 360_000
+    writeSlugged('alpha', seq, [{ role: 'dev', status: 'working', task: null, label: null }])
+    expect(scanAndMerge(dir, dir)).toBeNull()
+  })
+
+  // M6: mood carry-forward
+  it('M6: carries forward mood from the most-recent session that has one', () => {
+    const base = Date.now()
+    writeSlugged('alpha', base + 100, [{ role: 'dev', status: 'working', task: null, label: null }], { mood: 'frustrated', moodDuration: 20000 })
+    writeSlugged('beta', base + 200, [{ role: 'qa', status: 'working', task: null, label: null }], { mood: 'smooth', moodDuration: 30000 })
+    const result = scanAndMerge(dir, dir)
+    // beta has higher _seq → its mood wins
+    expect(result.mood).toBe('smooth')
+    expect(result.moodDuration).toBe(30000)
+  })
+
+  it('M6: no mood in merged output when no session has mood', () => {
+    const base = Date.now()
+    writeSlugged('alpha', base + 100, [{ role: 'dev', status: 'working', task: null, label: null }])
+    writeSlugged('beta', base + 200, [{ role: 'qa', status: 'working', task: null, label: null }])
+    const result = scanAndMerge(dir, dir)
+    expect(result.mood).toBeUndefined()
+  })
+
+  it('M6: finished session (all done) mood must not inject over an active session with no mood', () => {
+    // alpha: all agents done, has mood — must NOT contribute mood to merged output
+    // beta: one working agent, no mood
+    const base = Date.now()
+    writeSlugged('alpha', base + 1000, [{ role: 'dev', status: 'done', task: null, label: null }], { mood: 'frustrated', moodDuration: 20000 })
+    writeSlugged('beta', base + 100, [{ role: 'qa', status: 'working', task: null, label: null }])
+    const result = scanAndMerge(dir, dir)
+    // beta's agent is active → alpha's done-only session must not leak its mood
+    expect(result.mood).toBeUndefined()
+    // beta's agent is still live; alpha may render as a terminal event but must not
+    // contribute mood.
+    expect(result.agents.some(a => a.session === 'beta')).toBe(true)
+    expect(result.agents.some(a => a.session === 'alpha' && a.status === 'done')).toBe(true)
+  })
+
+  // Agent priority and role tiebreaker (multi-session path only — single session returns all agents)
+  it('picks most urgent (blocked > working) agent per session', () => {
+    const base = Date.now()
+    // Need 2 sessions to trigger the multi-session pick-one-representative path
+    writeSlugged('alpha', base + 100, [
+      { role: 'dev', status: 'working', task: null, label: null },
+      { role: 'qa',  status: 'blocked', task: 'stuck', label: null },
+    ])
+    writeSlugged('beta', base + 200, [{ role: 'ops', status: 'working', task: null, label: null }])
+    const result = scanAndMerge(dir, dir)
+    const alphaAgent = result.agents.find(a => a.session === 'alpha')
+    expect(alphaAgent.role).toMatch(/qa/)
+    expect(alphaAgent.status).toBe('blocked')
+  })
+
+  it('C1: role tiebreaker is stable when two agents share same status', () => {
+    const base = Date.now()
+    // Two working agents in same session — alphabetically first role wins as tiebreaker
+    writeSlugged('alpha', base + 100, [
+      { role: 'pm',  status: 'working', task: null, label: null },
+      { role: 'dev', status: 'working', task: null, label: null },
+    ])
+    writeSlugged('beta', base + 200, [{ role: 'qa', status: 'working', task: null, label: null }])
+    const r1 = scanAndMerge(dir, dir)
+    const r2 = scanAndMerge(dir, dir)
+    const alphaAgent1 = r1.agents.find(a => a.session === 'alpha')
+    const alphaAgent2 = r2.agents.find(a => a.session === 'alpha')
+    // Same agent picked each time (stable)
+    expect(alphaAgent1.role).toBe(alphaAgent2.role)
+    // dev < pm alphabetically → dev wins
+    expect(alphaAgent1.role).toMatch(/dev/)
+  })
+
+  it('includes FRESH terminal done representatives but not in activeCount', () => {
+    const base = Date.now()
+    writeSlugged('alpha', base + 100, [{ role: 'dev', status: 'done', task: null, label: null }])
+    writeSlugged('beta', base + 200, [{ role: 'qa', status: 'working', task: null, label: null }])
+    const result = scanAndMerge(dir, dir)
+    expect(result.agents.some(a => a.session === 'alpha' && a.status === 'done')).toBe(true)
+    expect(result.activeCount).toBe(1)
+  })
+
+  it('drops done representatives older than DONE_RENDER_MS so finished sessions do not loiter', () => {
+    const base = Date.now()
+    // alpha finished ~60s ago: past the ~45s done-render window but still inside the 5-min stale TTL.
+    writeSlugged('alpha', base - 60_000, [{ role: 'dev', status: 'done', task: null, label: null }])
+    writeSlugged('beta', base + 200, [{ role: 'qa', status: 'working', task: null, label: null }])
+    const result = scanAndMerge(dir, dir)
+    expect(result.agents.some(a => a.session === 'alpha')).toBe(false)
+    expect(result.agents.some(a => a.session === 'beta' && a.status === 'working')).toBe(true)
+    expect(result.activeCount).toBe(1)
+  })
+
+  it('keeps planning and awaiting-approval representatives in multi-session output', () => {
+    const base = Date.now()
+    writeSlugged('alpha', base + 100, [{ role: 'dev', status: 'planning', task: null, label: null }])
+    writeSlugged('beta', base + 200, [{ role: 'qa', status: 'awaiting-approval', task: null, label: null }])
+    const result = scanAndMerge(dir, dir)
+    expect(result.agents.some(a => a.session === 'alpha' && a.status === 'planning')).toBe(true)
+    expect(result.agents.some(a => a.session === 'beta' && a.status === 'awaiting-approval')).toBe(true)
+    expect(result.activeCount).toBe(2)
+  })
+
+  it('drops idle representatives from multi-session output so cleanup can run', () => {
+    const base = Date.now()
+    writeSlugged('alpha', base + 100, [{ role: 'dev', status: 'idle', task: null, label: null }])
+    writeSlugged('beta', base + 200, [{ role: 'qa', status: 'working', task: null, label: null }])
+    const result = scanAndMerge(dir, dir)
+    expect(result.agents.some(a => a.session === 'alpha')).toBe(false)
+    expect(result.agents.some(a => a.session === 'beta' && a.status === 'working')).toBe(true)
+    expect(result.activeCount).toBe(1)
+  })
+
+})
+
+// ─── helpers concat / de-dupe / bound (multi-session) ────────────────────────
+
+describe('helpers data path (multi-session)', () => {
+  let dir
+  beforeEach(() => { dir = tmpDir() })
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+
+  function writeSlugged(slug, seq, agents, extra = {}) {
+    writeSession(dir, `office-status-${slug}.json`, {
+      type: 'office-status', _seq: String(seq), _cwd: dir, agents, ...extra,
+    })
+  }
+
+  it('concatenates helpers from two sessions', () => {
+    const base = Date.now()
+    writeSlugged('alpha', base + 100,
+      [{ role: 'dev', status: 'working', task: null, label: null }],
+      { helpers: [{ id: 'dev#aaa', parentRole: 'dev', label: 'subdev-A' }] })
+    writeSlugged('beta', base + 200,
+      [{ role: 'qa', status: 'working', task: null, label: null }],
+      { helpers: [{ id: 'qa#bbb', parentRole: 'qa', label: 'sub-QA' }] })
+    const result = scanAndMerge(dir, dir)
+    expect(result.source).toBe('multi-session')
+    expect(Array.isArray(result.helpers)).toBe(true)
+    expect(result.helpers).toHaveLength(2)
+    const ids = result.helpers.map(h => h.id)
+    expect(ids).toContain('dev#aaa')
+    expect(ids).toContain('qa#bbb')
+  })
+
+  it('de-dupes helpers with the same id across sessions', () => {
+    const base = Date.now()
+    const sharedHelper = { id: 'dev#shared', parentRole: 'dev', label: 'dup' }
+    writeSlugged('alpha', base + 100,
+      [{ role: 'dev', status: 'working', task: null, label: null }],
+      { helpers: [sharedHelper] })
+    writeSlugged('beta', base + 200,
+      [{ role: 'qa', status: 'working', task: null, label: null }],
+      { helpers: [sharedHelper, { id: 'qa#unique', parentRole: 'qa' }] })
+    const result = scanAndMerge(dir, dir)
+    const ids = result.helpers.map(h => h.id)
+    // dev#shared appears only once despite being in both sessions
+    expect(ids.filter(id => id === 'dev#shared')).toHaveLength(1)
+    expect(ids).toContain('qa#unique')
+    expect(result.helpers).toHaveLength(2)
+  })
+
+  it('caps helpers at 64 entries', () => {
+    const base = Date.now()
+    const bigHelpers = Array.from({ length: 50 }, (_, i) => ({
+      id: `dev#h${i}`, parentRole: 'dev', label: `helper-${i}`,
+    }))
+    const moreHelpers = Array.from({ length: 30 }, (_, i) => ({
+      id: `qa#h${i}`, parentRole: 'qa',
+    }))
+    writeSlugged('alpha', base + 100,
+      [{ role: 'dev', status: 'working', task: null, label: null }],
+      { helpers: bigHelpers })
+    writeSlugged('beta', base + 200,
+      [{ role: 'qa', status: 'working', task: null, label: null }],
+      { helpers: moreHelpers })
+    const result = scanAndMerge(dir, dir)
+    expect(result.helpers.length).toBeLessThanOrEqual(64)
+  })
+
+  it('drops malformed helpers entries (missing id, bad parentRole, wrong type)', () => {
+    const base = Date.now()
+    writeSlugged('alpha', base + 100,
+      [{ role: 'dev', status: 'working', task: null, label: null }],
+      {
+        helpers: [
+          { id: 'dev#good', parentRole: 'dev', label: 'ok' },   // well-formed
+          { parentRole: 'dev' },                                  // missing id
+          { id: 'qa#bad', parentRole: 'notarole' },              // invalid parentRole
+          null,                                                   // null entry
+          42,                                                     // wrong type
+          { id: '', parentRole: 'dev' },                         // empty id
+        ],
+      })
+    writeSlugged('beta', base + 200,
+      [{ role: 'qa', status: 'working', task: null, label: null }],
+      { helpers: [] })
+    const result = scanAndMerge(dir, dir)
+    // Only the well-formed entry survives
+    expect(result.helpers).toHaveLength(1)
+    expect(result.helpers[0].id).toBe('dev#good')
+    expect(result.helpers[0].parentRole).toBe('dev')
+    expect(result.helpers[0].label).toBe('ok')
+  })
+
+  it('sets helpers:[] (present, empty) when all sessions have empty/absent helpers', () => {
+    // Fix [LOW] AVO helpers clear delay: merged.helpers must ALWAYS be set so an
+    // explicit cleared state propagates on the next tick (not left absent, which
+    // ingestion treats as "no information" → lingering ~60 s TTL).
+    const base = Date.now()
+    writeSlugged('alpha', base + 100, [{ role: 'dev', status: 'working', task: null, label: null }])
+    writeSlugged('beta', base + 200, [{ role: 'qa', status: 'working', task: null, label: null }])
+    const result = scanAndMerge(dir, dir)
+    // helpers must be present (an explicit []) — not absent
+    expect(result.helpers).toBeDefined()
+    expect(Array.isArray(result.helpers)).toBe(true)
+    expect(result.helpers).toHaveLength(0)
+  })
+
+  it('all-empty multi-session helpers:[] clears promptly (not lingering via TTL)', () => {
+    // Regression: previously `if (allHelpers.length > 0) merged.helpers = allHelpers`
+    // omitted helpers entirely when all sessions had no helpers, so ingestion saw
+    // "absent = no information" and kept a finished subagent's helper visible for up
+    // to the TTL (~60 s) instead of clearing on the next tick.
+    const base = Date.now()
+    // Session A: had a helper before, now explicitly cleared (helpers: [])
+    writeSlugged('alpha', base + 100,
+      [{ role: 'dev', status: 'working', task: null, label: null }],
+      { helpers: [] })
+    // Session B: never had helpers (key absent)
+    writeSlugged('beta', base + 200,
+      [{ role: 'qa', status: 'working', task: null, label: null }])
+    const result = scanAndMerge(dir, dir)
+    expect(result.source).toBe('multi-session')
+    // The field must be present and empty so ingestion clears the stale helper
+    expect(Object.prototype.hasOwnProperty.call(result, 'helpers')).toBe(true)
+    expect(result.helpers).toEqual([])
+  })
+
+  it('passes through helpers in single-session path via spread', () => {
+    const seq = freshSeq()
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: seq, _cwd: dir,
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+      helpers: [{ id: 'dev#x', parentRole: 'dev', label: 'single' }],
+    })
+    const result = scanAndMerge(dir, dir)
+    // Single session → spread includes helpers as-is
+    expect(Array.isArray(result.helpers)).toBe(true)
+    expect(result.helpers[0].id).toBe('dev#x')
+  })
+})
+
+// ─── getSessionStats ───────────────────────────────────────────────────────────
+
+describe('getSessionStats', () => {
+  let dir
+  beforeEach(() => { dir = tmpDir() })
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+
+  it('returns zeros when dir does not exist', () => {
+    const stats = getSessionStats(path.join(dir, 'no-such'), dir)
+    expect(stats.hookSessionCount).toBe(0)
+    expect(stats.fileWatcherPresent).toBe(false)
+  })
+
+  it('counts hook sessions matching projectRoot CWD', () => {
+    writeSession(dir, 'office-status-feat.json', {
+      type: 'office-status', _seq: freshSeq(), _cwd: dir,
+      agents: [], source: 'hook',
+    })
+    const stats = getSessionStats(dir, dir)
+    expect(stats.hookSessionCount).toBe(1)
+    expect(stats.fileWatcherPresent).toBe(false)
+  })
+
+  it('detects file-watcher sessions', () => {
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: freshSeq(),
+      agents: [], source: 'file-watcher',
+    })
+    const stats = getSessionStats(dir, dir)
+    expect(stats.fileWatcherPresent).toBe(true)
+  })
+
+  it('M3: skips sessions more than 5 min in the future (consistent with scanAndMerge)', () => {
+    writeSession(dir, 'office-status-feat.json', {
+      type: 'office-status', _seq: String(Date.now() + 360_000), _cwd: dir,
+      agents: [], source: 'hook',
+    })
+    const stats = getSessionStats(dir, dir)
+    expect(stats.hookSessionCount).toBe(0)
+  })
+
+  it('returns zeros when dir exists but is not readable (ENOTDIR guard)', () => {
+    // Write a *file* at the path so readdirSync would throw ENOTDIR
+    const filePath = path.join(dir, 'not-a-dir')
+    fs.writeFileSync(filePath, 'data')
+    const stats = getSessionStats(filePath, dir)
+    expect(stats.hookSessionCount).toBe(0)
+    expect(stats.fileWatcherPresent).toBe(false)
+  })
+})
+
+// ─── dedup: hasUniqueWorkflow carve-out ───────────────────────────────────────
+
+describe('dedup: hasUniqueWorkflow carve-out', () => {
+  let dir
+  beforeEach(() => { dir = tmpDir() })
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+
+  it('keeps bare file when it has a workflow no slugged session shares (even within 2s, hook source)', () => {
+    // Exercises hasUniqueWorkflow carve-out: isDup=true AND hasUniqueWorkflow=true → keep
+    const baseSeq = Date.now()
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: String(baseSeq), workflow: 'unique-workflow', source: 'claude-cli',
+      agents: [{ role: 'pm', status: 'working', task: null, label: null }],
+    })
+    writeSession(dir, 'office-status-feat.json', {
+      type: 'office-status', _seq: String(baseSeq + 500), _cwd: dir, workflow: 'other-workflow',
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    const result = scanAndMerge(dir, dir)
+    // Both sessions kept — bare file has unique workflow (carve-out prevents dedup)
+    expect(result.source).toBe('multi-session')
+    expect(result.sessionCount).toBe(2)
+  })
+
+  it('removes bare file when its workflow matches a slugged session (within 2s, hook source)', () => {
+    const baseSeq = Date.now()
+    const sharedWorkflow = 'shared-workflow'
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: String(baseSeq), workflow: sharedWorkflow, source: 'claude-cli',
+      agents: [{ role: 'pm', status: 'working', task: null, label: null }],
+    })
+    writeSession(dir, 'office-status-feat.json', {
+      type: 'office-status', _seq: String(baseSeq + 500), _cwd: dir, workflow: sharedWorkflow,
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    const result = scanAndMerge(dir, dir)
+    // Bare file deduped — same workflow
+    expect(result.source).not.toBe('multi-session')
+  })
+})
+
+// ─── file-watcher strict exclusion + _hint:no-hooks ──────────────────────────
+
+describe('file-watcher strict exclusion and _hint:no-hooks', () => {
+  let dir
+  beforeEach(() => { dir = tmpDir() })
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+
+  it('excludes file-watcher session from strict pass when a hook session exists', () => {
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: freshSeq(), source: 'file-watcher',
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    writeSession(dir, 'office-status-feat.json', {
+      type: 'office-status', _seq: freshSeq(), _cwd: dir, source: 'hook',
+      agents: [{ role: 'qa', status: 'working', task: null, label: null }],
+    })
+    const result = scanAndMerge(dir, dir)
+    // Hook session passes strict; file-watcher excluded from strict
+    expect(result).not.toBeNull()
+    expect(result._hint).toBeUndefined()
+    // Only the hook session should have been included
+    expect(result.source).not.toBe('multi-session')
+  })
+
+  it('sets _hint:no-hooks when only file-watcher sessions are available (fallback)', () => {
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: freshSeq(), source: 'file-watcher',
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    // projectRoot is something OTHER than dir so CWD match fails → strict pass empty → fallback
+    const result = scanAndMerge(dir, '/nonexistent-project-root')
+    expect(result).not.toBeNull()
+    expect(result._hint).toBe('no-hooks')
+  })
+
+  it('skips malformed JSON files gracefully', () => {
+    fs.writeFileSync(path.join(dir, 'office-status-bad.json'), '{ bad json }')
+    writeSession(dir, 'office-status-good.json', {
+      type: 'office-status', _seq: freshSeq(), _cwd: dir,
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    // Bad file skipped, good one processed
+    expect(scanAndMerge(dir, dir)).not.toBeNull()
+  })
+})
+
+// ─── fallback pass _cwd filtering ────────────────────────────────────────────
+
+describe('fallback pass _cwd filtering', () => {
+  let dir
+  beforeEach(() => { dir = tmpDir() })
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+
+  it('excludes a foreign-_cwd hook session from fallback so it cannot mix with local file-watcher', () => {
+    // Hook session from a different project — strict pass sees nothing (no match for dir),
+    // fallback must also exclude it.
+    writeSession(dir, 'office-status-other.json', {
+      type: 'office-status', _seq: freshSeq(), _cwd: '/some/other/project', source: 'claude-cli',
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: freshSeq(), source: 'file-watcher',
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    // projectRoot doesn't match either _cwd → strict empty → fallback
+    const result = scanAndMerge(dir, dir)
+    expect(result).not.toBeNull()
+    // Foreign hook session must NOT appear in merged output
+    expect(result._hint).toBe('no-hooks')
+    // All agents should come from file-watcher, not the foreign session
+    expect(result.source).not.toBe('multi-session')
+  })
+
+  it('excludes a slugged no-_cwd non-file-watcher session from fallback (old hook or foreign tool)', () => {
+    // A slugged file with no _cwd and source !== 'file-watcher' — e.g. old hook version
+    writeSession(dir, 'office-status-old-hook.json', {
+      type: 'office-status', _seq: freshSeq(), source: 'claude-cli',
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: freshSeq(), source: 'file-watcher',
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    // projectRoot doesn't match → strict empty → fallback
+    const result = scanAndMerge(dir, '/nonexistent-root')
+    expect(result).not.toBeNull()
+    // Old hook file must not suppress the _hint:'no-hooks' signal
+    expect(result._hint).toBe('no-hooks')
+  })
+
+  it('includes a file-watcher session and the bare file in fallback even when no matching _cwd exists', () => {
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: freshSeq(), source: 'file-watcher',
+      agents: [{ role: 'dev', status: 'working', task: 'edit', label: null }],
+    })
+    const result = scanAndMerge(dir, '/nonexistent-root')
+    expect(result).not.toBeNull()
+    expect(result._hint).toBe('no-hooks')
+  })
+
+  it('includes a matching-_cwd hook session in fallback when strict pass returns nothing (no file-watcher)', () => {
+    // Strict fails because the only session is file-watcher (excluded from strict).
+    // Fallback should include it and also the hook session if its _cwd matches.
+    writeSession(dir, 'office-status-feat.json', {
+      type: 'office-status', _seq: freshSeq(), _cwd: dir, source: 'claude-cli',
+      agents: [{ role: 'qa', status: 'working', task: null, label: null }],
+    })
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: freshSeq(), source: 'file-watcher',
+      agents: [{ role: 'dev', status: 'working', task: null, label: null }],
+    })
+    // Strict pass: feat.json has matching _cwd and source!='file-watcher' → included
+    // So we actually go through the strict path here, not fallback.
+    // Verify: strict returns the hook session, not file-watcher.
+    const result = scanAndMerge(dir, dir)
+    expect(result).not.toBeNull()
+    expect(result._hint).toBeUndefined()
+  })
+})
+
+describe('server observed activity summary', () => {
+  let dir
+  beforeEach(() => { dir = tmpDir() })
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
+
+  const idleAgent = { role: 'dev', status: 'idle', task: null, label: null }
+  const scoped = (agents, extra = {}) => ({
+    type: 'office-status', _seq: freshSeq(), _cwd: dir, source: 'hook', agents, ...extra,
+  })
+
+  it('reports a single explicitly scoped idle session without changing its representatives', () => {
+    writeSession(dir, 'office-status.json', scoped([idleAgent]))
+    const result = scanAndMerge(dir, dir)
+    expect(result.observedActivity.state).toBe('all-idle')
+    expect(result.observedActivity.expiresAt).toBeGreaterThan(Date.now())
+    expect(result.agents).toEqual([idleAgent])
+  })
+
+  it('reports two explicitly scoped idle sessions while preserving the empty multi-session representatives', () => {
+    writeSession(dir, 'office-status-alpha.json', scoped([idleAgent]))
+    writeSession(dir, 'office-status-beta.json', scoped([{ ...idleAgent, role: 'qa' }]))
+    const result = scanAndMerge(dir, dir)
+    expect(result.observedActivity.state).toBe('all-idle')
+    expect(result.agents).toEqual([])
+    expect(result.activeCount).toBe(0)
+  })
+
+  it.each(['working', 'thinking', 'done'])('reports %s as not-idle', status => {
+    writeSession(dir, 'office-status.json', scoped([{ ...idleAgent, status }]))
+    expect(scanAndMerge(dir, dir).observedActivity.state).toBe('not-idle')
+  })
+
+  it('does not infer all-idle from helpers or malformed agent data', () => {
+    writeSession(dir, 'office-status-helper.json', scoped([idleAgent], {
+      helpers: [{ id: 'helper-1', parentRole: 'dev' }],
+    }))
+    expect(scanAndMerge(dir, dir).observedActivity.state).toBe('not-idle')
+    fs.rmSync(path.join(dir, 'office-status-helper.json'))
+    writeSession(dir, 'office-status-bad.json', scoped([{ role: 'dev', status: 'mystery' }]))
+    expect(scanAndMerge(dir, dir).observedActivity.state).toBe('unknown')
+  })
+
+  it.each([{ unexpected: true }, 'active'])('treats malformed helpers as unknown evidence: %j', helpers => {
+    writeSession(dir, 'office-status.json', scoped([idleAgent], { helpers }))
+    expect(scanAndMerge(dir, dir).observedActivity.state).toBe('unknown')
+  })
+
+  it('does not let absent, unscoped, fallback, or future-sequenced sessions prove idle', () => {
+    writeSession(dir, 'office-status.json', {
+      type: 'office-status', _seq: freshSeq(), source: 'hook', agents: [idleAgent],
+    })
+    expect(scanAndMerge(dir, dir).observedActivity?.state).not.toBe('all-idle')
+    fs.rmSync(path.join(dir, 'office-status.json'))
+    writeSession(dir, 'office-status.json', scoped([idleAgent], { source: 'file-watcher' }))
+    expect(scanAndMerge(dir, '/different-project')?.observedActivity?.state).not.toBe('all-idle')
+    fs.rmSync(path.join(dir, 'office-status.json'))
+    const fixedNow = Date.now()
+    vi.spyOn(Date, 'now').mockReturnValue(fixedNow)
+    try {
+      writeSession(dir, 'office-status.json', scoped([idleAgent], { _seq: String(fixedNow + 1) }))
+      expect(scanAndMerge(dir, dir).observedActivity).toBeUndefined()
+    } finally {
+      vi.restoreAllMocks()
+    }
+  })
+
+  it('expires from the oldest source sequence and ignores a forged source summary', () => {
+    const oldestSeq = Date.now() - 20
+    writeSession(dir, 'office-status-alpha.json', {
+      ...scoped([idleAgent]), _seq: String(oldestSeq),
+      observedActivity: { state: 'all-idle', expiresAt: Date.now() + OBSERVED_ACTIVITY_TTL_MS },
+    })
+    writeSession(dir, 'office-status-beta.json', {
+      ...scoped([{ ...idleAgent, role: 'qa' }]), _seq: String(oldestSeq + 10),
+    })
+    expect(scanAndMerge(dir, dir).observedActivity.expiresAt).toBe(oldestSeq + OBSERVED_ACTIVITY_TTL_MS)
+  })
+
+  it('does not emit an observation past the source stale TTL', () => {
+    writeSession(dir, 'office-status.json', scoped([idleAgent], {
+      _seq: String(Date.now() - OBSERVED_ACTIVITY_TTL_MS - 1),
+    }))
+    expect(scanAndMerge(dir, dir)).toBeNull()
+  })
+
+  it('keeps a normalized POST idle fallback display-only when the original status was missing', () => {
+    const normalized = normalizePost({ type: 'office-status', agents: [{ role: 'dev' }] })
+    writeSession(dir, 'office-status.json', { ...normalized, _cwd: dir })
+    const result = scanAndMerge(dir, dir)
+    expect(result.agents[0].status).toBe('idle')
+    expect(result.observedActivity.state).toBe('unknown')
+    expect(result._postStatusInvalid).toBeUndefined()
+  })
+})

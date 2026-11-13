@@ -1,0 +1,85 @@
+{
+  "name": "agent-virtual-office",
+  "version": "1.7.0",
+  "description": "Pixel-art virtual office that visualizes your AI coding agents in real time — Claude Code, Codex, Gemini CLI, or any tool that can POST status. Pure SVG, zero backend, runs locally.",
+  "main": "bin/cli.js",
+  "bin": {
+    "agent-virtual-office": "./bin/cli.js"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "node server.mjs",
+    "build:single": "vite build --outDir dist-single",
+    "serve": "node server.mjs",
+    "smoke": "node scripts/render-smoke.mjs",
+    "smoke:panel": "node scripts/panel-features-verify.mjs",
+    "smoke:pack": "node scripts/pack-smoke.mjs",
+    "soak": "node scripts/sim-soak.mjs",
+    "soak:spawn": "node scripts/sim-soak.mjs --spawn",
+    "rhythm": "node scripts/office-rhythm.mjs",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "virtual-office",
+    "agent",
+    "ai",
+    "ai-agents",
+    "coding-agent",
+    "pixel-art",
+    "claude",
+    "claude-code",
+    "claude-code-hooks",
+    "gemini",
+    "gemini-cli",
+    "codex",
+    "llm",
+    "visualization",
+    "status",
+    "developer-tools",
+    "svg",
+    "react"
+  ],
+  "author": "KbWen",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "homepage": "https://github.com/KbWen/agent-virtual-office#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KbWen/agent-virtual-office.git"
+  },
+  "type": "commonjs",
+  "files": [
+    "bin/",
+    "public/",
+    "src/",
+    "index.html",
+    "vite.config.mjs",
+    "server.mjs",
+    "package.json",
+    "Dockerfile",
+    "docker-compose.yml",
+    "docs/deployment/"
+  ],
+  "dependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^6.0.5",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.2.4",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.1",
+    "vitest": "^4.1.11"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1",
+    "source-map-js": "^1.2.2"
+  }
+}

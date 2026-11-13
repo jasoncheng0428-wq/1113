@@ -1,0 +1,821 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { startOfficeLife, triggerInteractiveEvent } from '../src/systems/officeLife.js'
+import { TIME_CHECK_INTERVAL } from '../src/systems/constants.js'
+
+// Minimal fake store — officeLife only calls getState() and the actions it returns.
+// The agents map is mutated in place so group-event state changes are observable
+// (mirrors how the real zustand store survives across an officeLife teardown/re-init).
+function makeFakeStore(externalStatus = {}) {
+  let updateTimeCalls = 0
+  const state = {
+    isPaused: false,
+    activeEvent: null,
+    agents: {
+      dev: { id: 'dev', inGroupEvent: false, groupTarget: null, behavior: 'typing', expression: 'normal', bubble: null, position: { x: 100, y: 100 } },
+      qa: { id: 'qa', inGroupEvent: false, groupTarget: null, behavior: 'typing', expression: 'normal', bubble: null, position: { x: 200, y: 200 } },
+    },
+    externalStatus,
+    hour: 9,
+  }
+  const api = {
+    get agents() { return state.agents },
+    get isPaused() { return state.isPaused },
+    get activeEvent() { return state.activeEvent },
+    get externalStatus() { return state.externalStatus },
+    get hour() { return state.hour },
+    updateTime: () => { updateTimeCalls++ },
+    setActiveEvent: (e) => { state.activeEvent = e },
+    clearActiveEvent: () => { state.activeEvent = null },
+    setAgentBehavior: (id, behavior, expression, bubble) => {
+      if (!state.agents[id]) return
+      // Mirror the real store: behavior/expression/bubble update, inGroupEvent untouched.
+      state.agents[id] = {
+        ...state.agents[id],
+        behavior,
+        expression: expression || state.agents[id].expression,
+        bubble: bubble || null,
+      }
+    },
+    setAgentGroupEvent: (id, { behavior, expression, bubble, groupTarget } = {}) => {
+      if (!state.agents[id]) return
+      state.agents[id] = { ...state.agents[id], behavior, expression, bubble: bubble || null, inGroupEvent: true, groupTarget: groupTarget || null }
+    },
+    setMultipleAgentGroupEvents: (updates) => {
+      for (const u of updates) api.setAgentGroupEvent(u.id, u)
+    },
+    clearAgentGroupEvent: (id) => {
+      if (!state.agents[id]) return
+      state.agents[id] = { ...state.agents[id], inGroupEvent: false, groupTarget: null }
+    },
+    clearBubble: (id) => {
+      if (!state.agents[id]) return
+      state.agents[id] = { ...state.agents[id], bubble: null }
+    },
+  }
+  return {
+    getState: () => api,
+    _updateTimeCalls: () => updateTimeCalls,
+    _setHour: (h) => { state.hour = h },
+  }
+}
+
+describe('officeLife — lifecycle teardown', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-05T09:00:00')) // Monday, 09:00 — no time-linked event
+  })
+
+  afterEach(() => {
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+  })
+
+  it('cleanup stops the time interval — updateTime is not called after teardown', () => {
+    const store = makeFakeStore({ gate: { changedAt: Date.now() } })
+    const cleanup = startOfficeLife(store)
+
+    vi.advanceTimersByTime(TIME_CHECK_INTERVAL * 2)
+    const callsBeforeCleanup = store._updateTimeCalls()
+    expect(callsBeforeCleanup).toBeGreaterThanOrEqual(2)
+
+    cleanup()
+    vi.advanceTimersByTime(TIME_CHECK_INTERVAL * 5)
+    // No further updateTime calls — the interval was cleared.
+    expect(store._updateTimeCalls()).toBe(callsBeforeCleanup)
+  })
+
+  it('double-init without cleanup fully tears down the prior instance (no leaked time interval)', () => {
+    const storeA = makeFakeStore()
+    startOfficeLife(storeA) // intentionally NOT cleaned up — simulates HMR / missed cleanup
+
+    vi.advanceTimersByTime(TIME_CHECK_INTERVAL)
+    const aCallsAtReinit = storeA._updateTimeCalls()
+    expect(aCallsAtReinit).toBeGreaterThanOrEqual(1)
+
+    // Re-init: the guard must cancel storeA's intervals, not leak them alongside storeB's.
+    const storeB = makeFakeStore()
+    const cleanupB = startOfficeLife(storeB)
+
+    vi.advanceTimersByTime(TIME_CHECK_INTERVAL * 3)
+    // storeA's time interval must be dead — its updateTime count is frozen.
+    expect(storeA._updateTimeCalls()).toBe(aCallsAtReinit)
+    // storeB's interval is the only live one.
+    expect(storeB._updateTimeCalls()).toBeGreaterThanOrEqual(3)
+
+    cleanupB()
+  })
+
+  it('teardown cancels in-flight interactive events — deferred callbacks do not fire after cleanup', () => {
+    const store = makeFakeStore({ gate: { changedAt: Date.now() } })
+    const cleanup = startOfficeLife(store)
+
+    // Trigger a multi-stage interactive event (review-debate has 6s/12s deferred steps).
+    const triggered = triggerInteractiveEvent(store, 'review-debate')
+    expect(triggered).toBe(true)
+
+    const setBehaviorSpy = vi.spyOn(store.getState(), 'setAgentBehavior')
+    cleanup() // tears down before the 6s/12s callbacks fire
+
+    // Advance past every deferred step — none should run against the torn-down store.
+    vi.advanceTimersByTime(20000)
+    expect(setBehaviorSpy).not.toHaveBeenCalled()
+  })
+
+  it('teardown mid-event releases participants — no agent stranded inGroupEvent: true', () => {
+    const store = makeFakeStore({ gate: { changedAt: Date.now() } })
+    const cleanup = startOfficeLife(store)
+
+    // Start a group event that locks dev + qa into inGroupEvent: true.
+    expect(triggerInteractiveEvent(store, 'review-debate')).toBe(true)
+    expect(store.getState().agents.dev.inGroupEvent).toBe(true)
+    expect(store.getState().agents.qa.inGroupEvent).toBe(true)
+
+    // Tear down BEFORE the executeEvent cleanup timer (event.duration = 18000ms) fires.
+    cleanup()
+
+    // The cancelled cleanup timer early-returns and never releases the agents — teardown
+    // itself must release them, otherwise doSchedule + watchdog both skip them forever.
+    expect(store.getState().agents.dev.inGroupEvent).toBe(false)
+    expect(store.getState().agents.qa.inGroupEvent).toBe(false)
+    expect(store.getState().activeEvent).toBe(null)
+  })
+
+  it('double-init mid-event releases the prior instance participants', () => {
+    const store = makeFakeStore({ gate: { changedAt: Date.now() } })
+    startOfficeLife(store) // intentionally NOT cleaned up — simulates HMR / missed cleanup
+
+    expect(triggerInteractiveEvent(store, 'review-debate')).toBe(true)
+    expect(store.getState().agents.dev.inGroupEvent).toBe(true)
+
+    // Re-init without cleanup: the double-init guard must release the prior instance's
+    // stranded group-event participants, not just cancel its timers.
+    const cleanupB = startOfficeLife(store)
+    expect(store.getState().agents.dev.inGroupEvent).toBe(false)
+    expect(store.getState().agents.qa.inGroupEvent).toBe(false)
+
+    cleanupB()
+  })
+})
+
+// ─── Rare-event ("participants": "all") full lifecycle — R69 fix coverage ───
+// Before R69, rare events had no `participants` field so pickParticipants returned
+// pool.slice(0,3); R69 added "all". These tests exercise the COMPLETE lifecycle of a
+// rare event (mark inGroupEvent → run → release on duration) end-to-end, which had
+// zero coverage — the prior officeLife tests only exercise teardown/cancel paths.
+describe('officeLife — rare event (participants: all) lifecycle', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-05T09:00:00'))
+  })
+  afterEach(() => {
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+  })
+
+  // Every rare event id with its duration, from src/config/officeEvents.json.
+  const RARE = [
+    { id: 'dog-visit', duration: 20000 },
+    { id: 'ac-broken', duration: 15000 },
+    { id: 'boss-visit', duration: 10000 },
+    { id: 'group-stretch', duration: 8000 },
+  ]
+
+  for (const { id, duration } of RARE) {
+    it(`${id}: all participants are marked inGroupEvent then released on duration`, () => {
+      const store = makeFakeStore({ gate: { changedAt: Date.now() } })
+      const cleanup = startOfficeLife(store)
+
+      expect(triggerInteractiveEvent(store, id)).toBe(true)
+      expect(store.getState().activeEvent?.id).toBe(id)
+
+      // Advance past staggered setAgentGroupEvent callbacks (dog-visit: i*800, group-stretch: i*300).
+      vi.advanceTimersByTime(6000)
+      // dev has a HOME_POSITIONS entry — boss-visit (home-filtered) and the others all
+      // mark a static roster agent into the group event.
+      expect(store.getState().agents.dev.inGroupEvent).toBe(true)
+
+      // After the event duration elapses, executeEvent's cleanup releases everyone.
+      vi.advanceTimersByTime(duration + 1000)
+      expect(store.getState().agents.dev.inGroupEvent).toBe(false)
+      expect(store.getState().agents.qa.inGroupEvent).toBe(false)
+      expect(store.getState().agents.dev.groupTarget).toBe(null)
+      expect(store.getState().activeEvent).toBe(null)
+
+      cleanup()
+    })
+  }
+
+  it('rare event releases participants even when a dynamic worktree agent is present', () => {
+    // pickParticipants("all") returns Object.keys(agents) — including a composite
+    // worktree id. group-stretch sets EVERY participant inGroupEvent; the cleanup
+    // must release the dynamic agent too, not strand it inGroupEvent: true.
+    const store = makeFakeStore({ gate: { changedAt: Date.now() } })
+    // Add a dynamic worktree agent.
+    store.getState().agents['feat-x~dev'] = {
+      id: 'feat-x~dev', session: 'feat-x', inGroupEvent: false, groupTarget: null,
+      behavior: 'typing', expression: 'normal', bubble: null, position: { x: 200, y: 80 },
+    }
+    const cleanup = startOfficeLife(store)
+
+    expect(triggerInteractiveEvent(store, 'group-stretch')).toBe(true)
+    vi.advanceTimersByTime(2000)
+    expect(store.getState().agents['feat-x~dev'].inGroupEvent).toBe(true)
+
+    vi.advanceTimersByTime(9000) // past duration 8000
+    expect(store.getState().agents['feat-x~dev'].inGroupEvent).toBe(false)
+    expect(store.getState().agents['feat-x~dev'].groupTarget).toBe(null)
+
+    cleanup()
+  })
+
+  it('a second event cannot start while a rare event is active', () => {
+    const store = makeFakeStore({ gate: { changedAt: Date.now() } })
+    const cleanup = startOfficeLife(store)
+
+    expect(triggerInteractiveEvent(store, 'boss-visit')).toBe(true)
+    // activeEvent is set — a concurrent trigger must be refused.
+    expect(triggerInteractiveEvent(store, 'dog-visit')).toBe(false)
+    expect(store.getState().activeEvent?.id).toBe('boss-visit')
+
+    vi.advanceTimersByTime(11000)
+    expect(store.getState().activeEvent).toBe(null)
+    // Once cleared, a new event can start again.
+    expect(triggerInteractiveEvent(store, 'dog-visit')).toBe(true)
+
+    cleanup()
+  })
+})
+
+// ─── R72: hour-14 post-lunch drowsiness must not corrupt group events ───
+// The 14:00 drowsiness time-event applies a 'tired' expression via setAgentBehavior,
+// which does NOT honour inGroupEvent. Before R72 it overwrote the behavior/
+// expression/bubble of agents mid-group-event (a standup straddling 14:00) and the
+// 30s release reverted ANY 'tired' agent — including an organic 'tired'. The fix
+// snapshots the precise drowsy set and skips in-group agents in both loops.
+describe('officeLife — hour-14 drowsiness respects group events (R72)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    // Monday so no Friday group-meeting fires alongside the hour-14 branch.
+    vi.setSystemTime(new Date('2026-01-05T13:59:30'))
+    // Pin Math.random so the random daily/rare event schedulers in startOfficeLife
+    // arm their timers at the FAR end of their ranges (DAILY 180000ms, RARE 600000ms) —
+    // far beyond these tests' ~90s advance window. Without this, a daily event could
+    // fire mid-test, pick 'dev' as a participant, and clobber the group-event state the
+    // test asserts on (stochastic — fails only when the random interval lands in-window).
+    // These tests exercise the hour-14 drowsiness branch ONLY; random events are noise.
+    vi.spyOn(Math, 'random').mockReturnValue(0.999999)
+  })
+  afterEach(() => {
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('does NOT overwrite an agent that is locked in a group event', () => {
+    const store = makeFakeStore({ gate: { changedAt: Date.now() } })
+    store._setHour(14)
+    const cleanup = startOfficeLife(store)
+
+    // dev is mid group event (e.g. a standup straddling the 14:00 boundary).
+    store.getState().setAgentGroupEvent('dev', {
+      behavior: 'meeting', expression: 'focused', bubble: 'Standup', groupTarget: null,
+    })
+
+    // First time-event interval tick fires the hour-14 drowsiness branch.
+    vi.advanceTimersByTime(TIME_CHECK_INTERVAL + 100)
+
+    const dev = store.getState().agents.dev
+    // The group event's fields must survive — officeLife owns them during a group event.
+    expect(dev.inGroupEvent).toBe(true)
+    expect(dev.behavior).toBe('meeting')
+    expect(dev.expression).toBe('focused')
+    expect(dev.bubble).toBe('Standup')
+
+    // A non-group agent IS made drowsy.
+    expect(store.getState().agents.qa.expression).toBe('tired')
+
+    cleanup()
+  })
+
+  it('the 30s release reverts only the agents it made drowsy, skipping group events', () => {
+    const store = makeFakeStore({ gate: { changedAt: Date.now() } })
+    store._setHour(14)
+    const cleanup = startOfficeLife(store)
+
+    // qa is free → becomes drowsy. dev is free at apply time too.
+    vi.advanceTimersByTime(TIME_CHECK_INTERVAL + 100)
+    expect(store.getState().agents.qa.expression).toBe('tired')
+    expect(store.getState().agents.dev.expression).toBe('tired')
+
+    // dev joins a group event AFTER being made drowsy — the 30s release must not
+    // clobber the group event even though dev's expression was 'tired'.
+    store.getState().setAgentGroupEvent('dev', {
+      behavior: 'meeting', expression: 'happy', bubble: 'Meeting', groupTarget: null,
+    })
+
+    // 30s release fires.
+    vi.advanceTimersByTime(30000)
+
+    // qa reverted to normal; dev's in-progress group event untouched.
+    expect(store.getState().agents.qa.expression).toBe('normal')
+    expect(store.getState().agents.dev.inGroupEvent).toBe(true)
+    expect(store.getState().agents.dev.expression).toBe('happy')
+    expect(store.getState().agents.dev.behavior).toBe('meeting')
+
+    cleanup()
+  })
+})
+
+// ─── pickParticipants filtering behaviour ────────────────────────────
+// pickParticipants is private — tested via triggerInteractiveEvent.
+// Key invariant: array-participant events exclude externally-busy agents;
+// 'all' events fall back to the full roster when <2 agents are available.
+describe('officeLife — pickParticipants filtering', () => {
+  // 3-agent fake store so we can block one and still have ≥2 available.
+  function make3AgentStore(externalStatus = {}) {
+    const state = {
+      isPaused: false, activeEvent: null,
+      agents: {
+        dev:  { id: 'dev',  inGroupEvent: false, groupTarget: null, behavior: 'typing', expression: 'normal', bubble: null, position: { x: 100, y: 100 } },
+        qa:   { id: 'qa',   inGroupEvent: false, groupTarget: null, behavior: 'typing', expression: 'normal', bubble: null, position: { x: 200, y: 200 } },
+        arch: { id: 'arch', inGroupEvent: false, groupTarget: null, behavior: 'typing', expression: 'normal', bubble: null, position: { x: 300, y: 200 } },
+      },
+      externalStatus,
+      hour: 9,
+    }
+    const api = {
+      get agents()         { return state.agents },
+      get isPaused()       { return state.isPaused },
+      get activeEvent()    { return state.activeEvent },
+      get externalStatus() { return state.externalStatus },
+      get hour()           { return state.hour },
+      updateTime: () => {},
+      setActiveEvent:   (e) => { state.activeEvent = e },
+      clearActiveEvent: ()  => { state.activeEvent = null },
+      setAgentBehavior: (id, behavior, expression, bubble) => {
+        if (!state.agents[id]) return
+        state.agents[id] = { ...state.agents[id], behavior, expression: expression || state.agents[id].expression, bubble: bubble || null }
+      },
+      setAgentGroupEvent: (id, { behavior, expression, bubble, groupTarget } = {}) => {
+        if (!state.agents[id]) return
+        state.agents[id] = { ...state.agents[id], behavior, expression, bubble: bubble || null, inGroupEvent: true, groupTarget: groupTarget || null }
+      },
+      setMultipleAgentGroupEvents: (updates) => { for (const u of updates) api.setAgentGroupEvent(u.id, u) },
+      clearAgentGroupEvent: (id) => {
+        if (!state.agents[id]) return
+        state.agents[id] = { ...state.agents[id], inGroupEvent: false, groupTarget: null }
+      },
+      clearBubble: (id) => {
+        if (!state.agents[id]) return
+        state.agents[id] = { ...state.agents[id], bubble: null }
+      },
+    }
+    return { getState: () => api }
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-05T09:00:00'))
+    // Pin random so scheduled daily/rare events arm far beyond the test window.
+    vi.spyOn(Math, 'random').mockReturnValue(0.999999)
+  })
+  afterEach(() => {
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('array participants: both dev+qa free → review-debate locks both', () => {
+    const store = make3AgentStore({ gate: { changedAt: Date.now() } })
+    const cleanup = startOfficeLife(store)
+
+    expect(triggerInteractiveEvent(store, 'review-debate')).toBe(true)
+    expect(store.getState().agents.dev.inGroupEvent).toBe(true)
+    expect(store.getState().agents.qa.inGroupEvent).toBe(true)
+    expect(store.getState().agents.arch.inGroupEvent).toBe(false)
+
+    cleanup()
+  })
+
+  it('array participants: dev is working externally → excluded → review-debate handler early-returns (no one locked)', () => {
+    const store = make3AgentStore({
+      dev: { status: 'working', expiresAt: Date.now() + 300000 },
+    })
+    const cleanup = startOfficeLife(store)
+
+    // pickParticipants(['dev','qa']) returns ['qa'] only.
+    // review-debate handler: if (!participants.includes('dev') || ...) return → no group event
+    triggerInteractiveEvent(store, 'review-debate')
+
+    expect(store.getState().agents.dev.inGroupEvent).toBe(false)
+    expect(store.getState().agents.qa.inGroupEvent).toBe(false)
+
+    cleanup()
+  })
+
+  it('all participants: with ≥2 available, blocked agent is excluded', () => {
+    // dev is working → available = [qa, arch] (≥2) → group-stretch uses [qa, arch]
+    const store = make3AgentStore({
+      dev: { status: 'working', expiresAt: Date.now() + 300000 },
+    })
+    const cleanup = startOfficeLife(store)
+
+    expect(triggerInteractiveEvent(store, 'group-stretch')).toBe(true)
+    vi.advanceTimersByTime(4000) // staggered setAgentGroupEvent callbacks
+
+    expect(store.getState().agents.dev.inGroupEvent).toBe(false)  // excluded (working)
+    expect(store.getState().agents.qa.inGroupEvent).toBe(true)
+    expect(store.getState().agents.arch.inGroupEvent).toBe(true)
+
+    cleanup()
+  })
+
+  it('random-1-neighbor (coffee-spill): always produces 1-2 participants', () => {
+    const store = make3AgentStore({ gate: { changedAt: Date.now() } })
+    const cleanup = startOfficeLife(store)
+
+    expect(triggerInteractiveEvent(store, 'coffee-spill')).toBe(true)
+    vi.advanceTimersByTime(3000) // inner 1500ms setTimeout fires
+
+    const locked = Object.values(store.getState().agents).filter((a) => a.inGroupEvent)
+    expect(locked.length).toBeGreaterThanOrEqual(1)
+    expect(locked.length).toBeLessThanOrEqual(2)
+
+    cleanup()
+  })
+
+  it('done/idle external status is treated as available — not excluded', () => {
+    const store = make3AgentStore({
+      dev: { status: 'done', expiresAt: Date.now() + 10000 },
+      gate: { changedAt: Date.now() },
+    })
+    const cleanup = startOfficeLife(store)
+
+    // dev is 'done' → isAvailable → included in review-debate
+    triggerInteractiveEvent(store, 'review-debate')
+    expect(store.getState().agents.dev.inGroupEvent).toBe(true)
+    expect(store.getState().agents.qa.inGroupEvent).toBe(true)
+
+    cleanup()
+  })
+})
+
+// ─── triggerInteractiveEvent guard conditions ─────────────────────────
+describe('triggerInteractiveEvent — guards (isPaused, unknown event)', () => {
+  // Minimal inline store — triggerInteractiveEvent only reads isPaused and activeEvent
+  // on the fast-return path, so we don't need the full officeLife fake store here.
+  function makeGuardStore({ isPaused = false, activeEvent = null, agents = {} } = {}) {
+    const state = { isPaused, activeEvent, agents, externalStatus: {}, hour: 9 }
+    return {
+      getState: () => ({
+        get isPaused()    { return state.isPaused },
+        get activeEvent() { return state.activeEvent },
+        agents: state.agents,
+        externalStatus: state.externalStatus,
+        hour: state.hour,
+        updateTime:              () => {},
+        setActiveEvent:          (e) => { state.activeEvent = e },
+        clearActiveEvent:        () => { state.activeEvent = null },
+        setAgentBehavior:        () => {},
+        setAgentGroupEvent:      () => {},
+        setMultipleAgentGroupEvents: () => {},
+        clearAgentGroupEvent:    () => {},
+        clearBubble:             () => {},
+      }),
+    }
+  }
+
+  it('returns false and fires no event when isPaused is true', () => {
+    const store = makeGuardStore({ isPaused: true })
+    const result = triggerInteractiveEvent(store, 'review-debate')
+    expect(result).toBe(false)
+    expect(store.getState().activeEvent).toBeNull()
+  })
+
+  it('returns false and fires no event when an event is already active', () => {
+    const store = makeGuardStore({ activeEvent: { id: 'standup' } })
+    const result = triggerInteractiveEvent(store, 'dog-visit')
+    expect(result).toBe(false)
+    // activeEvent stays as the original (not overwritten).
+    expect(store.getState().activeEvent?.id).toBe('standup')
+  })
+
+  it('returns false for an unknown event id with no side-effects', () => {
+    const store = makeGuardStore()
+    const result = triggerInteractiveEvent(store, 'totally-made-up-event-id')
+    expect(result).toBe(false)
+    expect(store.getState().activeEvent).toBeNull()
+  })
+
+  it('returns true for a known event id when nothing blocks it', () => {
+    // Smoke check: all guards pass, EVENT_BY_ID lookup succeeds.
+    // The office needs an actual cast. This fixture used to pass `agents: {}` and still expect
+    // `true` — which asserted the AVO-191 defect: an EMPTY office fired a set-piece with zero
+    // participants and set activeEvent, the global mutex, blocking every later event for its
+    // duration. The guard-chain intent of the test is preserved; the phantom is not.
+    const store = makeGuardStore({
+      agents: {
+        dev: { id: 'dev', inGroupEvent: false, groupTarget: null, behavior: 'typing', expression: 'normal', bubble: null, position: { x: 100, y: 100 } },
+        qa:  { id: 'qa',  inGroupEvent: false, groupTarget: null, behavior: 'typing', expression: 'normal', bubble: null, position: { x: 200, y: 200 } },
+      },
+    })
+    const result = triggerInteractiveEvent(store, 'boss-visit')
+    // EVENT_BY_ID['boss-visit'] exists → should return true.
+    expect(result).toBe(true)
+  })
+
+  it('an office with no agents fires nothing and leaves activeEvent null (AVO-191)', () => {
+    const store = makeGuardStore()          // agents: {}
+    const result = triggerInteractiveEvent(store, 'boss-visit')
+    expect(result).toBe(false)
+    expect(store.getState().activeEvent).toBeNull()
+  })
+})
+
+// ─── Fix coverage: Fix 1 (lunch-nap mutex), Fix 2 (inGroupEvent exclusion), Fix 3 (empty pool) ───
+
+describe('officeLife — Fix 1: lunch-nap sets activeEvent (mutex participation)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    // Set system time to just before 12:00 so the first tick sees hour 12.
+    vi.setSystemTime(new Date('2026-01-05T11:59:30'))
+    // Pin random. The previous accounting here was WRONG and hid a real defect: it claimed
+    // "first two calls are for the agentId filter", but startOfficeLife consumes two calls
+    // arming the daily/rare schedulers BEFORE the interval ever ticks (measured). The nap
+    // filter therefore received 0.999 twice, picked NOBODY — and the test still passed,
+    // because the old code called setActiveEvent BEFORE computing the cast. It was asserting
+    // a phantom lunch-nap holding the global event mutex for 45s with nobody asleep.
+    // Correct accounting: calls 1-2 arm the schedulers (0.999 = far out), calls 3-4 are the
+    // per-agent nap filter (0.3 = include), everything after is scheduler re-arming.
+    let callCount = 0
+    vi.spyOn(Math, 'random').mockImplementation(() => {
+      callCount++
+      if (callCount <= 2) return 0.999
+      if (callCount <= 4) return 0.3
+      return 0.999
+    })
+  })
+  afterEach(() => {
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('hour-12 lunch-nap sets activeEvent so concurrent scheduled events are blocked', () => {
+    const store = makeFakeStore({ gate: { changedAt: Date.now() } })
+    store._setHour(12)
+    const cleanup = startOfficeLife(store)
+
+    // Advance one tick to fire the timeEventInterval at hour 12.
+    vi.advanceTimersByTime(TIME_CHECK_INTERVAL + 100)
+
+    // Someone must ACTUALLY be asleep. Without this the activeEvent assertion below passes
+    // on a phantom event — which is exactly how the pre-AVO-194 defect survived review.
+    const napping = Object.values(store.getState().agents).filter((a) => a.behavior === 'nap')
+    expect(napping.length).toBeGreaterThan(0)
+
+    // The lunch-nap block must have set activeEvent — it now participates in the mutex.
+    expect(store.getState().activeEvent).not.toBeNull()
+    expect(store.getState().activeEvent?.id).toBe('lunch-nap')
+
+    // After 45 s the nap releases and clears activeEvent.
+    vi.advanceTimersByTime(45000)
+    expect(store.getState().activeEvent).toBeNull()
+
+    cleanup()
+  })
+})
+
+describe('officeLife — Fix 2: in-group agent is not re-picked by a second event', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-05T09:00:00'))
+    vi.spyOn(Math, 'random').mockReturnValue(0.999999)
+  })
+  afterEach(() => {
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('an agent already inGroupEvent is excluded from pickParticipants for a second event', () => {
+    // Use a 3-agent store so locking dev still leaves qa+arch available.
+    const state = {
+      isPaused: false, activeEvent: null,
+      agents: {
+        dev:  { id: 'dev',  inGroupEvent: true,  groupTarget: null, behavior: 'meeting', expression: 'normal', bubble: null, position: { x: 100, y: 100 } },
+        qa:   { id: 'qa',   inGroupEvent: false, groupTarget: null, behavior: 'typing',  expression: 'normal', bubble: null, position: { x: 200, y: 200 } },
+        arch: { id: 'arch', inGroupEvent: false, groupTarget: null, behavior: 'typing',  expression: 'normal', bubble: null, position: { x: 300, y: 200 } },
+      },
+      externalStatus: {},
+      hour: 9,
+    }
+    const api = {
+      get agents()         { return state.agents },
+      get isPaused()       { return state.isPaused },
+      get activeEvent()    { return state.activeEvent },
+      get externalStatus() { return state.externalStatus },
+      get hour()           { return state.hour },
+      updateTime:              () => {},
+      setActiveEvent:          (e) => { state.activeEvent = e },
+      clearActiveEvent:        ()  => { state.activeEvent = null },
+      setAgentBehavior:        (id, behavior, expression, bubble) => {
+        if (!state.agents[id]) return
+        state.agents[id] = { ...state.agents[id], behavior, expression: expression || state.agents[id].expression, bubble: bubble || null }
+      },
+      setAgentGroupEvent: (id, { behavior, expression, bubble, groupTarget } = {}) => {
+        if (!state.agents[id]) return
+        state.agents[id] = { ...state.agents[id], behavior, expression, bubble: bubble || null, inGroupEvent: true, groupTarget: groupTarget || null }
+      },
+      setMultipleAgentGroupEvents: (updates) => { for (const u of updates) api.setAgentGroupEvent(u.id, u) },
+      clearAgentGroupEvent: (id) => {
+        if (!state.agents[id]) return
+        state.agents[id] = { ...state.agents[id], inGroupEvent: false, groupTarget: null }
+      },
+      clearBubble: (id) => {
+        if (!state.agents[id]) return
+        state.agents[id] = { ...state.agents[id], bubble: null }
+      },
+    }
+    const store = { getState: () => api }
+
+    // group-stretch uses participants: 'all' — with fix, dev (inGroupEvent) must be excluded.
+    const result = triggerInteractiveEvent(store, 'group-stretch')
+    expect(result).toBe(true)
+    // Advance past staggered setAgentGroupEvent callbacks.
+    vi.advanceTimersByTime(4000)
+
+    // dev was already inGroupEvent — must NOT be re-picked and its state unchanged.
+    expect(state.agents.dev.inGroupEvent).toBe(true)
+    expect(state.agents.dev.behavior).toBe('meeting') // original behavior preserved
+
+    // qa and arch were free → they join the stretch.
+    expect(state.agents.qa.inGroupEvent).toBe(true)
+    expect(state.agents.arch.inGroupEvent).toBe(true)
+  })
+})
+
+describe('officeLife — Fix 3: coffee-spill on empty pool does not create phantom activeEvent', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-05T09:00:00'))
+    vi.spyOn(Math, 'random').mockReturnValue(0.999999)
+  })
+  afterEach(() => {
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('coffee-spill with zero agents returns [] — no phantom activeEvent blocks future events', () => {
+    // Empty-agents store: pool will be [] → random-1-neighbor must return []
+    // without inserting undefined. triggerInteractiveEvent still sets activeEvent
+    // (that is expected) — the key invariant is that the spiller is not undefined.
+    const state = {
+      isPaused: false, activeEvent: null,
+      agents: {},
+      externalStatus: {},
+      hour: 9,
+    }
+    let setActiveEventCallCount = 0
+    const api = {
+      get agents()         { return state.agents },
+      get isPaused()       { return state.isPaused },
+      get activeEvent()    { return state.activeEvent },
+      get externalStatus() { return state.externalStatus },
+      get hour()           { return state.hour },
+      updateTime:              () => {},
+      setActiveEvent:          (e) => { state.activeEvent = e; setActiveEventCallCount++ },
+      clearActiveEvent:        ()  => { state.activeEvent = null },
+      setAgentBehavior:        () => {},
+      setAgentGroupEvent:      (id, opts) => {
+        // With empty pool, participants[0] is undefined — this must NOT be called
+        // (or if called with undefined id, must not throw or corrupt state).
+        if (id === undefined) throw new Error('setAgentGroupEvent called with undefined id — phantom participant from empty pool')
+      },
+      setMultipleAgentGroupEvents: () => {},
+      clearAgentGroupEvent:    () => {},
+      clearBubble:             () => {},
+    }
+    const store = { getState: () => api }
+
+    // Must not throw (no "undefined id" error from setAgentGroupEvent).
+    expect(() => triggerInteractiveEvent(store, 'coffee-spill')).not.toThrow()
+
+    // After 45 s the event duration elapses and clearActiveEvent fires — no phantom lock.
+    vi.advanceTimersByTime(50000)
+    expect(state.activeEvent).toBeNull()
+  })
+})
+
+// ─── AVO-194: time-linked events must not state something false about REAL work ──────────────
+// The two time-linked handlers below never consulted externalStatus, so at 12:00 a genuinely
+// working agent was shown asleep, and at 14:00 one was painted tired with its voice cleared.
+// Same R1/ADR-008 class AVO-191 closed for scheduled events, missed because the availability
+// predicate was a closure inside pickParticipants rather than shared.
+
+describe('officeLife — AVO-194: lunch nap never sleeps a genuinely working agent', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-05T11:59:30'))
+    // Every call arms far out. The nap filter short-circuits on availability BEFORE reaching
+    // Math.random for a busy agent, so the value here cannot rescue a broken filter.
+    vi.spyOn(Math, 'random').mockReturnValue(0.999)
+  })
+  afterEach(() => {
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('a working agent is not given nap/sleepy/lunch-bubble at 12:00', () => {
+    const store = makeFakeStore({
+      dev: { status: 'working', changedAt: Date.now() },
+      qa: { status: 'working', changedAt: Date.now() },
+    })
+    store._setHour(12)
+    // The dice MUST say "nap" here, or this test passes on the broken code too: the old filter
+    // was `!inGroupEvent && Math.random() < 0.5`, so a 0.999 roll spared these agents for the
+    // wrong reason. Calls 1-2 arm the schedulers far out; from call 3 the roll includes.
+    // Verified by mutation: with the source fix reverted, this test goes red.
+    let callCount = 0
+    Math.random.mockImplementation(() => {
+      callCount++
+      return callCount <= 2 ? 0.999 : 0.3
+    })
+    const cleanup = startOfficeLife(store)
+    vi.advanceTimersByTime(TIME_CHECK_INTERVAL + 100)
+
+    for (const a of Object.values(store.getState().agents)) {
+      expect(a.behavior).not.toBe('nap')
+      expect(a.expression).not.toBe('sleepy')
+      expect(a.inGroupEvent).toBe(false)
+    }
+    cleanup()
+  })
+
+  it('an all-busy office sets NO phantom activeEvent (the 45s global mutex stays free)', () => {
+    const store = makeFakeStore({
+      dev: { status: 'working', changedAt: Date.now() },
+      qa: { status: 'blocked', changedAt: Date.now() },
+    })
+    store._setHour(12)
+    const cleanup = startOfficeLife(store)
+    vi.advanceTimersByTime(TIME_CHECK_INTERVAL + 100)
+
+    // activeEvent is the global event mutex. Setting it for a nap with an empty cast blocks
+    // every later event for 45s while nothing is on screen — the AVO-191 phantom-event hazard.
+    expect(store.getState().activeEvent).toBeNull()
+    cleanup()
+  })
+
+  it('an idle agent still naps — the guard narrows the cast, it does not disable the event', () => {
+    const store = makeFakeStore({ dev: { status: 'working', changedAt: Date.now() } })
+    store._setHour(12)
+    let callCount = 0
+    Math.random.mockImplementation(() => {
+      callCount++
+      // calls 1-2 arm the schedulers far out; the next call is the filter for the one
+      // available agent (qa, which has no externalStatus entry).
+      return callCount <= 2 ? 0.999 : 0.3
+    })
+    const cleanup = startOfficeLife(store)
+    vi.advanceTimersByTime(TIME_CHECK_INTERVAL + 100)
+
+    expect(store.getState().agents.qa.behavior).toBe('nap')
+    expect(store.getState().agents.dev.behavior).not.toBe('nap')
+    expect(store.getState().activeEvent?.id).toBe('lunch-nap')
+    cleanup()
+  })
+})
+
+describe('officeLife — AVO-194 (third site): post-lunch drowsiness spares real work', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-05T13:59:30'))
+    vi.spyOn(Math, 'random').mockReturnValue(0.999)
+  })
+  afterEach(() => {
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('a working agent keeps its expression AND its bubble at 14:00; an untracked one goes tired', () => {
+    const store = makeFakeStore({ dev: { status: 'working', changedAt: Date.now() } })
+    store.getState().setAgentBehavior('dev', 'typing', 'focused', 'running tests')
+    store._setHour(14)
+    const cleanup = startOfficeLife(store)
+    vi.advanceTimersByTime(TIME_CHECK_INTERVAL + 100)
+
+    const dev = store.getState().agents.dev
+    // Two harms in one line of old code: a fabricated emotional state, and the `null` bubble
+    // argument clearing what the agent was actually saying.
+    expect(dev.expression).toBe('focused')
+    expect(dev.bubble).toBe('running tests')
+
+    // The charm beat still happens for agents with no real signal.
+    expect(store.getState().agents.qa.expression).toBe('tired')
+    cleanup()
+  })
+})

@@ -1,0 +1,175 @@
+// Pure label/format helpers used by ControlPanel (and NarrowRoster). Extracted out of the
+// ControlPanel.jsx god-component so they're unit-testable WITHOUT importing the React/JSX module
+// (engineering-retro debt cleanup). No React here — plain functions of plain data.
+import { classifyTask, classifyBlockedReason } from '../systems/classify'
+
+// Collapse a raw tool/task name into the same short chip the character's TaskLabel (AVO-103) shows,
+// so the panel never displays the ugly `mcp__Server__tool` wire form. Built-ins stay short (`Bash`),
+// MCP tools collapse to `server::tool`, unknowns are truncated. Returns null for an empty task so
+// callers can fall back to the localized status label.
+export function taskChipLabel(task) {
+  if (!task) return null
+  return classifyTask(task).visualLabel
+}
+
+// AVO-110: the RAW hook label ("❌ npm test failed") — kept as the HOVER/DECODE layer only (shown in
+// ControlPanel row titles). It is NOT the glance label anymore: the visible glance label now comes
+// from the structured reasonCode token (see agentLineLabel) so the panel never re-parses free text
+// (NO-RENDER-SIDE-DERIVATION). Returns null for any non-blocked / label-less agent.
+const BLOCKED_REASON_CAP = 28
+export function blockedReasonLabel(ext) {
+  if (!ext || ext.status !== 'blocked' || !ext.label) return null
+  const l = ext.label
+  return l.length > BLOCKED_REASON_CAP ? l.slice(0, BLOCKED_REASON_CAP - 1) + '…' : l
+}
+
+// AVO-110: the panel-row "icon" channel — a recognizable glyph per blocked-reason (HTML roster, so
+// an emoji is fine here; the in-scene office badge uses bespoke SVG per AC-7). Derived from the
+// reasonCode token via classifyBlockedReason; null for any non-blocked agent. Pairs with the i18n
+// text from agentLineLabel so the row is icon + text (never icon-only, never colour-only).
+const REASON_GLYPH = Object.freeze({
+  'test-run-failed':  '🧪',
+  'build-failed':     '🛠️',
+  'deps-failed':      '📦',
+  'blocked-unknown':  '❔',
+  // AVO-148: structured-event reasons
+  'permission-denied': '🚫',
+  'api-rate-limit':    '⏳',
+  'api-auth-failed':   '🔑',
+})
+export function blockedReasonGlyph(ext) {
+  if (!ext || ext.status !== 'blocked') return null
+  return REASON_GLYPH[classifyBlockedReason(ext.reasonCode).reason] || REASON_GLYPH['blocked-unknown']
+}
+
+// AVO-108: compact token formatter — 604937 → "605k", 1240000 → "1.2M", 842 → "842".
+export function formatTokens(n) {
+  if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) return '0'
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M'
+  if (n >= 1_000) return Math.round(n / 1_000) + 'k'
+  return String(Math.round(n))
+}
+
+// The single label a ControlPanel agent row shows. AVO-110: for a blocked agent it is the localized
+// REASON label derived from the structured reasonCode token (claims only what the signal proves —
+// "Test run" / "卡在測試執行", never "test failed"), NOT a re-parse of the raw ext.label. Otherwise:
+// the collapsed tool chip, then the localized status word. `t` is the i18n lookup.
+export function agentLineLabel(ext, t) {
+  if (!ext) return null
+  if (ext.status === 'blocked') {
+    const { reason } = classifyBlockedReason(ext.reasonCode)
+    return t(`blockedReason.${reason}.label`, t('statusLabels.blocked', 'Blocked'))
+  }
+  return taskChipLabel(ext.task)
+    || t(`statusLabels.${ext.status}`, ext.status)
+}
+
+// Persistent action strip: surface only honest human-action states. This mirrors the roster's
+// team strip without importing UI code: blocked and awaiting-approval need attention; workflow
+// phases and decorative events are intentionally excluded.
+export function attentionStripState({ agents = [], externalStatus = {}, nameForId = (id) => id } = {}) {
+  const rows = Array.isArray(agents) ? agents : Object.values(agents || {})
+  const items = []
+  for (const agent of rows) {
+    const id = agent?.id
+    if (!id) continue
+    const status = externalStatus[id]?.status || agent.status
+    if (status !== 'blocked' && status !== 'awaiting-approval') continue
+    items.push({ id, status, name: nameForId(id) || id })
+  }
+  return {
+    count: items.length,
+    items,
+    names: items.map((item) => item.name),
+  }
+}
+
+// Bottom rail declutter: show agents that carry a real current signal, fold the rest into a quiet
+// count. The full office already renders every character; the rail should answer "what changed?"
+// rather than repeat every idle name at all times.
+export function controlPanelPresenceRows({ agents = [], externalStatus = {} } = {}) {
+  const source = Array.isArray(agents) ? agents : Object.values(agents || {})
+  const rows = []
+  for (const agent of source) {
+    const id = agent?.id
+    if (!id) continue
+    const ext = externalStatus[id]
+    const status = ext?.status || agent.status || 'idle'
+    const hasSignal = !!(ext?.task || ext?.label || ext?.reasonCode)
+    if (status !== 'idle' || hasSignal) rows.push({ agent, ext, status })
+  }
+  return {
+    rows,
+    quietCount: Math.max(0, source.filter((agent) => agent?.id).length - rows.length),
+  }
+}
+
+// AVO-130 — collapse the connection/integration indicator into ONE health dot. Pure derivation of
+// the single highest-severity state from the two independent signals the bar used to render as 2–4
+// separate pills: `statusSource` ('external' | 'fallback' | local/demo) and `integrationHealth.state`
+// ('offline' | 'degraded' | else). Single result by severity precedence so the worst real state
+// always wins and is never hidden — offline > degraded > fallback > live > idle.
+//   level   — which dot to paint.
+//   trouble — true for offline/degraded/fallback: caller auto-shows the inline label (not hover-only)
+//             so a real problem is glanceable without interaction (status-legibility law).
+//   labelKey / labelVal — i18n key (+ {0} replacement) for the detail text; reuses existing strings.
+//   tone    — semantic color band for the dot ('red' | 'amber' | 'emerald' | 'gray').
+//   pulse   — whether the dot animates (live signals pulse; offline solid; idle quiet).
+const HEALTH_DOT = Object.freeze({
+  offline:  { trouble: true,  labelKey: 'status.apiOffline',  tone: 'red',     pulse: false },
+  degraded: { trouble: true,  labelKey: 'status.apiRetrying', tone: 'amber',   pulse: true  },
+  fallback: { trouble: true,  labelKey: 'ui.fallbackAgents',  tone: 'amber',   pulse: true  },
+  live:     { trouble: false, labelKey: 'ui.live',            tone: 'emerald', pulse: true  },
+  idle:     { trouble: false, labelKey: 'status.local',       tone: 'gray',    pulse: false },
+})
+export function healthDotState({ statusSource, integrationHealth, externalCount = 0 } = {}) {
+  const ih = integrationHealth?.state
+  let level
+  if (ih === 'offline') level = 'offline'
+  else if (ih === 'degraded') level = 'degraded'
+  else if (statusSource === 'fallback') level = 'fallback'
+  else if (statusSource === 'external') level = 'live'
+  else level = 'idle'
+  const cfg = HEALTH_DOT[level]
+  return {
+    level,
+    trouble: cfg.trouble,
+    tone: cfg.tone,
+    pulse: cfg.pulse,
+    labelKey: cfg.labelKey,
+    labelVal: level === 'fallback' ? externalCount : null,
+  }
+}
+
+// AVO-199 changes only the existing detail, never the dot severity/color contract.
+export function healthDotDetail(dot, translate, calm = {}) {
+  const detail = translate(dot.labelKey, dot.level).replace('{0}', dot.labelVal == null ? '' : String(dot.labelVal))
+  if (dot.trouble || !calm.enabled || calm.mode !== 'quiet') return detail
+  return `${detail} · ${translate('status.observedIdle', 'Observed sessions idle')}`
+}
+
+// #28 — opt-in debug flag for the RAF-watchdog diagnostic chip. The chip is non-actionable for
+// everyone except a dev actively chasing a walk-loop stall, so it is OFF by default even in dev and
+// only renders when explicitly opted in: `?debug=raf` in the URL or localStorage `avo.debug.raf=on`
+// (same load-time pattern as `?lang` / `avo.theme`). The watchdog's `console.warn` is unaffected —
+// that remains the always-on dev signal for anyone who opens devtools. Reads window lazily so it
+// stays safe in SSR/test (no window → false).
+export function isRafDebugEnabled(win = typeof window !== 'undefined' ? window : undefined) {
+  if (!win) return false
+  try {
+    const params = new URLSearchParams(win.location?.search || '')
+    if (params.get('debug') === 'raf') return true
+    return win.localStorage?.getItem('avo.debug.raf') === 'on'
+  } catch {
+    return false
+  }
+}
+
+// #28 — DEV-only diagnostics gate for the RAF-watchdog restart counter. Shown only in dev builds, only
+// once a stall has happened (count > 0), AND only when the debug flag is opted in (isRafDebugEnabled),
+// so it's invisible at rest, off-by-default for everyone, and zero-cost in production
+// (`import.meta.env.DEV` is a compile-time constant → the render branch is dead-code-eliminated from
+// the prod bundle). `debugEnabled` is injectable for DOM-free unit testing.
+export function shouldShowWatchdogDiag(count, isDev = import.meta.env.DEV, debugEnabled = isRafDebugEnabled()) {
+  return !!isDev && !!debugEnabled && typeof count === 'number' && count > 0
+}

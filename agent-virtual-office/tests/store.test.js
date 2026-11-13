@@ -1,0 +1,252 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { useOfficeStore, createPersistedState } from '../src/systems/store.js'
+
+// ─── markIntegrationProbe — state machine ────────────────────────────
+describe('store — markIntegrationProbe state machine', () => {
+  beforeEach(() => {
+    useOfficeStore.setState({
+      integrationHealth: {
+        state: 'idle',
+        lastSuccessAt: null,
+        lastErrorAt: null,
+        consecutiveFailures: 0,
+      },
+    })
+  })
+
+  it('first successful probe: idle → online, consecutiveFailures=0', () => {
+    useOfficeStore.getState().markIntegrationProbe({ ok: true })
+    const h = useOfficeStore.getState().integrationHealth
+    expect(h.state).toBe('online')
+    expect(h.consecutiveFailures).toBe(0)
+    expect(h.lastSuccessAt).toBeGreaterThan(0)
+    expect(h.lastErrorAt).toBeNull()
+  })
+
+  it('first failure: idle → degraded, consecutiveFailures=1', () => {
+    useOfficeStore.getState().markIntegrationProbe({ ok: false })
+    const h = useOfficeStore.getState().integrationHealth
+    expect(h.state).toBe('degraded')
+    expect(h.consecutiveFailures).toBe(1)
+    expect(h.lastErrorAt).toBeGreaterThan(0)
+    expect(h.lastSuccessAt).toBeNull()
+  })
+
+  it('two consecutive failures: degraded, consecutiveFailures=2', () => {
+    useOfficeStore.getState().markIntegrationProbe({ ok: false })
+    useOfficeStore.getState().markIntegrationProbe({ ok: false })
+    expect(useOfficeStore.getState().integrationHealth.state).toBe('degraded')
+    expect(useOfficeStore.getState().integrationHealth.consecutiveFailures).toBe(2)
+  })
+
+  it('three consecutive failures: → offline, consecutiveFailures=3', () => {
+    useOfficeStore.getState().markIntegrationProbe({ ok: false })
+    useOfficeStore.getState().markIntegrationProbe({ ok: false })
+    useOfficeStore.getState().markIntegrationProbe({ ok: false })
+    expect(useOfficeStore.getState().integrationHealth.state).toBe('offline')
+    expect(useOfficeStore.getState().integrationHealth.consecutiveFailures).toBe(3)
+  })
+
+  it('fourth failure when already offline: capped at 3, no re-render (same-value guard)', () => {
+    // Drive to offline first
+    for (let i = 0; i < 3; i++) useOfficeStore.getState().markIntegrationProbe({ ok: false })
+    const before = useOfficeStore.getState().integrationHealth
+
+    useOfficeStore.getState().markIntegrationProbe({ ok: false })
+    const after = useOfficeStore.getState().integrationHealth
+
+    // State and failures unchanged — the set() returned {} (no-op)
+    expect(after.state).toBe('offline')
+    expect(after.consecutiveFailures).toBe(3)
+    // Object identity: {} merge → new object, but same-value guard prevents
+    // any field change so the no-op return keeps the reference stable
+    expect(after.consecutiveFailures).toBe(before.consecutiveFailures)
+  })
+
+  it('recovery: offline → online after a successful probe, counter reset', () => {
+    for (let i = 0; i < 3; i++) useOfficeStore.getState().markIntegrationProbe({ ok: false })
+    expect(useOfficeStore.getState().integrationHealth.state).toBe('offline')
+
+    useOfficeStore.getState().markIntegrationProbe({ ok: true })
+    const h = useOfficeStore.getState().integrationHealth
+    expect(h.state).toBe('online')
+    expect(h.consecutiveFailures).toBe(0)
+    expect(h.lastSuccessAt).toBeGreaterThan(0)
+  })
+
+  it('success when already online renews freshness while preserving state and failure count', () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    try {
+      useOfficeStore.getState().markIntegrationProbe({ ok: true })
+      const firstSuccess = useOfficeStore.getState().integrationHealth
+
+      // At the same timestamp, this is a true duplicate and should be a no-op.
+      useOfficeStore.getState().markIntegrationProbe({ ok: true })
+      expect(useOfficeStore.getState().integrationHealth).toBe(firstSuccess)
+
+      // A later successful probe refreshes freshness despite unchanged status and counter.
+      now.mockReturnValue(2_000)
+      useOfficeStore.getState().markIntegrationProbe({ ok: true })
+      const h = useOfficeStore.getState().integrationHealth
+      expect(h.state).toBe('online')
+      expect(h.consecutiveFailures).toBe(0)
+      expect(h.lastSuccessAt).toBe(2_000)
+      expect(h).not.toBe(firstSuccess)
+    } finally {
+      vi.restoreAllMocks()
+    }
+  })
+})
+
+// ─── setStatusSource / setIntegrationSource — same-value guard ───────
+describe('store — setStatusSource / setIntegrationSource idempotency', () => {
+  beforeEach(() => {
+    useOfficeStore.setState({ statusSource: 'organic', integrationSource: null })
+  })
+
+  it('setStatusSource changes value when different', () => {
+    useOfficeStore.getState().setStatusSource('external')
+    expect(useOfficeStore.getState().statusSource).toBe('external')
+  })
+
+  it('setStatusSource is idempotent when called with the same value', () => {
+    useOfficeStore.setState({ statusSource: 'external' })
+    useOfficeStore.getState().setStatusSource('external')
+    expect(useOfficeStore.getState().statusSource).toBe('external')
+  })
+
+  it('setIntegrationSource sets a new source', () => {
+    useOfficeStore.getState().setIntegrationSource('codex-cli')
+    expect(useOfficeStore.getState().integrationSource).toBe('codex-cli')
+  })
+
+  it('setIntegrationSource is idempotent on same value', () => {
+    useOfficeStore.setState({ integrationSource: 'codex-cli' })
+    useOfficeStore.getState().setIntegrationSource('codex-cli')
+    expect(useOfficeStore.getState().integrationSource).toBe('codex-cli')
+  })
+
+  it('setIntegrationSource(undefined) → null (falsy coercion)', () => {
+    useOfficeStore.setState({ integrationSource: 'codex-cli' })
+    useOfficeStore.getState().setIntegrationSource(undefined)
+    expect(useOfficeStore.getState().integrationSource).toBeNull()
+  })
+
+  it('setIntegrationSource("") → null (empty string is falsy)', () => {
+    useOfficeStore.getState().setIntegrationSource('')
+    expect(useOfficeStore.getState().integrationSource).toBeNull()
+  })
+})
+
+// ─── setSelectedAgent — toggle behaviour ─────────────────────────────
+describe('store — setSelectedAgent toggle', () => {
+  beforeEach(() => {
+    useOfficeStore.setState({ selectedAgent: null })
+  })
+
+  it('selecting an agent when none is selected → selects it', () => {
+    useOfficeStore.getState().setSelectedAgent('dev')
+    expect(useOfficeStore.getState().selectedAgent).toBe('dev')
+  })
+
+  it('re-selecting the same agent deselects it (toggle to null)', () => {
+    useOfficeStore.setState({ selectedAgent: 'dev' })
+    useOfficeStore.getState().setSelectedAgent('dev')
+    expect(useOfficeStore.getState().selectedAgent).toBeNull()
+  })
+
+  it('selecting a different agent switches the selection', () => {
+    useOfficeStore.setState({ selectedAgent: 'dev' })
+    useOfficeStore.getState().setSelectedAgent('qa')
+    expect(useOfficeStore.getState().selectedAgent).toBe('qa')
+  })
+
+  it('clearSelectedAgent always sets null regardless of current selection', () => {
+    useOfficeStore.setState({ selectedAgent: 'arch' })
+    useOfficeStore.getState().clearSelectedAgent()
+    expect(useOfficeStore.getState().selectedAgent).toBeNull()
+  })
+})
+
+// ─── setActiveWorkflow — same-value guard ─────────────────────────────
+describe('store — setActiveWorkflow same-value guard', () => {
+  beforeEach(() => {
+    useOfficeStore.setState({ activeWorkflow: null })
+  })
+
+  it('sets a workflow name', () => {
+    useOfficeStore.getState().setActiveWorkflow('Review')
+    expect(useOfficeStore.getState().activeWorkflow).toBe('Review')
+  })
+
+  it('clears when called with null', () => {
+    useOfficeStore.setState({ activeWorkflow: 'Build' })
+    useOfficeStore.getState().setActiveWorkflow(null)
+    expect(useOfficeStore.getState().activeWorkflow).toBeNull()
+  })
+
+  it('setActiveWorkflow(undefined) → null (nullish coercion)', () => {
+    useOfficeStore.setState({ activeWorkflow: 'Build' })
+    useOfficeStore.getState().setActiveWorkflow(undefined)
+    expect(useOfficeStore.getState().activeWorkflow).toBeNull()
+  })
+
+  it('same value is idempotent', () => {
+    useOfficeStore.setState({ activeWorkflow: 'Build' })
+    useOfficeStore.getState().setActiveWorkflow('Build')
+    expect(useOfficeStore.getState().activeWorkflow).toBe('Build')
+  })
+})
+
+// ─── recordWatchdogRestart — diagnostic counter ──────────────────────
+describe('store — recordWatchdogRestart', () => {
+  beforeEach(() => {
+    useOfficeStore.setState({ watchdogRestarts: 0 })
+  })
+
+  it('starts at zero and increments monotonically per call', () => {
+    expect(useOfficeStore.getState().watchdogRestarts).toBe(0)
+    useOfficeStore.getState().recordWatchdogRestart()
+    useOfficeStore.getState().recordWatchdogRestart()
+    useOfficeStore.getState().recordWatchdogRestart()
+    expect(useOfficeStore.getState().watchdogRestarts).toBe(3)
+  })
+
+  it('is transient — excluded from the persisted snapshot, so it resets on reload', () => {
+    useOfficeStore.getState().recordWatchdogRestart()
+    expect(useOfficeStore.getState().watchdogRestarts).toBe(1) // live state holds it
+    const persisted = createPersistedState(useOfficeStore.getState())
+    expect(persisted.watchdogRestarts).toBeUndefined() // but it is never written to disk
+  })
+})
+
+// #47 — sceneBounds publishes the active viewBox so overlays stay inside the VISIBLE scene (default
+// 0..800 × 0..560 OR the panel crop). The x-range clamps speech bubbles horizontally; the y-range
+// (added for the 2026-09-19 review, REV-01/02) keeps the inspector card and the bubble flip inside a
+// panel crop that starts well below y=0. Default office bounds = {minX:0, minY:0, w:800, h:560}.
+describe('store — sceneBounds (#47 bubble edge clamp bounds + REV-01/02 vertical bounds)', () => {
+  beforeEach(() => {
+    useOfficeStore.setState({ sceneBounds: { minX: 0, minY: 0, w: 800, h: 560 } })
+  })
+
+  it('defaults to the full default-office viewBox {minX:0, minY:0, w:800, h:560}', () => {
+    expect(useOfficeStore.getInitialState().sceneBounds).toEqual({ minX: 0, minY: 0, w: 800, h: 560 })
+  })
+
+  it('setSceneBounds stores all four numbers of a panel crop', () => {
+    useOfficeStore.getState().setSceneBounds(40, 135, 580, 300)
+    expect(useOfficeStore.getState().sceneBounds).toEqual({ minX: 40, minY: 135, w: 580, h: 300 })
+  })
+
+  it('a change to ONLY the vertical bounds is still published (the crop shapes share an x-range)', () => {
+    useOfficeStore.getState().setSceneBounds(40, 120, 580, 380)
+    useOfficeStore.getState().setSceneBounds(40, 135, 580, 300)
+    expect(useOfficeStore.getState().sceneBounds).toEqual({ minX: 40, minY: 135, w: 580, h: 300 })
+  })
+
+  it('setSceneBounds preserves object identity when unchanged (no needless re-render)', () => {
+    const before = useOfficeStore.getState().sceneBounds
+    useOfficeStore.getState().setSceneBounds(0, 0, 800, 560) // same values
+    expect(useOfficeStore.getState().sceneBounds).toBe(before) // same reference
+  })
+})

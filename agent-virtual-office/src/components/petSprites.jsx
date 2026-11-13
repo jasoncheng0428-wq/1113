@@ -1,0 +1,352 @@
+import React from 'react'
+import { PET_MODES } from '../systems/petState.js'
+
+// ─── Pet sprites (cosmetic skins for #39) ──────────────────────────────────────────────────────
+// Each sprite is a pure function of (mode, reducedMotion). COSMETIC ONLY — the mode is decided
+// upstream by the honest barometer (derivePetState/resolvePetMode); a sprite just draws the pose for
+// whatever mode it's handed, identically across types. Drawn around local origin (0,0) = floor
+// contact; the parent <g> positions/flips/scales it.
+
+// ── Cat (default) ──
+function CatSprite({ mode, reducedMotion, reaction }) {
+  const fur = '#9B8579', dark = '#6E5E54', belly = '#D9CCBF'
+  if (mode === PET_MODES.NAP) {
+    return (
+      <g aria-hidden="true" data-cozy-pet-reaction={reaction ? 'cat' : undefined}>
+        <ellipse cx={0} cy={0} rx={9} ry={5.5} fill={fur} />
+        <ellipse cx={0} cy={1.5} rx={6} ry={3} fill={belly} opacity="0.5" />
+        <circle cx={-6} cy={-1} r={3.6} fill={fur} />
+        <path d="M -8.6 -3 l 1.4 -2.2 l 1.4 2.2 Z" fill={fur}
+          transform={reaction ? 'rotate(-12 -7.2 -3)' : undefined} />
+        <path d="M -7.4 -1.2 q 1 0.8 2 0" stroke={dark} strokeWidth="0.5" fill="none" />
+        <path d="M 8 0 q 5 0 4 -4" stroke={fur} strokeWidth="2.4" fill="none" strokeLinecap="round" />      </g>
+    )
+  }
+  if (mode === PET_MODES.HIDE) {
+    return (
+      <g aria-hidden="true">
+        <ellipse cx={0} cy={1} rx={8} ry={3.6} fill={fur} />
+        <circle cx={6} cy={-0.5} r={3.4} fill={fur} />
+        <path d="M 3.4 -3 l -1.8 -1 l 1.2 2 Z" fill={dark} />
+        <path d="M 8.6 -3 l 1.8 -1 l -1.2 2 Z" fill={dark} />
+        <circle cx={5} cy={-0.6} r={0.7} fill={dark} />
+        <circle cx={7.4} cy={-0.6} r={0.7} fill={dark} />
+        <path d="M -8 1 q -3 1 -2 3" stroke={fur} strokeWidth="2" fill="none" strokeLinecap="round" />
+      </g>
+    )
+  }
+  if (mode === PET_MODES.ALERT) {
+    return (
+      <g aria-hidden="true">
+        <path d="M -7 1 q -4 2 -3 4" stroke={fur} strokeWidth="2.2" fill="none" strokeLinecap="round" />
+        <ellipse cx={0} cy={1} rx={5.5} ry={5} fill={fur} />
+        <ellipse cx={0} cy={2.5} rx={3} ry={2.4} fill={belly} opacity="0.55" />
+        <circle cx={2} cy={-4} r={3.8} fill={fur} />
+        <path d="M -0.6 -6.4 l -0.4 -3.4 l 2.2 1.8 Z" fill={fur} />
+        <path d="M 4.6 -6.4 l 0.4 -3.4 l -2.2 1.8 Z" fill={fur} />
+        <circle cx={0.6} cy={-4.2} r={1} fill={dark} />
+        <circle cx={3.4} cy={-4.2} r={1} fill={dark} />      </g>
+    )
+  }
+  if (mode === PET_MODES.CELEBRATE) {
+    return (
+      <g aria-hidden="true">
+        <path d="M -7 0 q -3 -3 -1 -8" stroke={fur} strokeWidth="2.4" fill="none" strokeLinecap="round" />
+        <ellipse cx={-1} cy={1} rx={7} ry={4.2} fill={fur} />
+        <ellipse cx={-1} cy={2.6} rx={4} ry={2} fill={belly} opacity="0.55" />
+        <rect x={-4} y={4} width={1.6} height={3} rx={0.8} fill={dark} />
+        <rect x={2} y={4} width={1.6} height={3} rx={0.8} fill={dark} />
+        <circle cx={6} cy={-2} r={4} fill={fur} />
+        <path d="M 3.2 -5 l -0.6 -3 l 2.4 1.6 Z" fill={fur} />
+        <path d="M 8.8 -5 l 0.6 -3 l -2.4 1.6 Z" fill={fur} />
+        <path d="M 4 -2.4 q 0.8 0.7 1.6 0" stroke={dark} strokeWidth="0.6" fill="none" />
+        <path d="M 6.8 -2.4 q 0.8 0.7 1.6 0" stroke={dark} strokeWidth="0.6" fill="none" />
+      </g>
+    )
+  }
+  const excited = mode === PET_MODES.EXCITED
+  return (
+    <g aria-hidden="true" data-cozy-pet-reaction={reaction ? 'cat' : undefined}>
+      {excited
+        ? <path d="M -7 0 q -5 -2 -4 -7" stroke={fur} strokeWidth="2.2" fill="none" strokeLinecap="round" />
+        : <path d="M -7 0 q -5 1 -5 -3" stroke={fur} strokeWidth="2.2" fill="none" strokeLinecap="round" />}
+      <ellipse cx={-1} cy={1} rx={7} ry={4.2} fill={fur} />
+      <ellipse cx={-1} cy={2.6} rx={4} ry={2} fill={belly} opacity="0.55" />
+      <rect x={-4} y={4} width={1.6} height={3} rx={0.8} fill={dark} />
+      <rect x={2} y={4} width={1.6} height={3} rx={0.8} fill={dark} />
+      <circle cx={6} cy={-1.5} r={4} fill={fur} />
+      <path d="M 3.2 -4.4 l -0.6 -3 l 2.4 1.6 Z" fill={fur} />
+      <path d="M 8.8 -4.4 l 0.6 -3 l -2.4 1.6 Z" fill={fur} />
+      {reaction ? (
+        <g fill="none" stroke={dark} strokeWidth="0.65" strokeLinecap="round">
+          <path d="M 3.8 -1.8 q 0.8 0.9 1.6 0" />
+          <path d="M 6.6 -1.8 q 0.8 0.9 1.6 0" />
+        </g>
+      ) : <><circle cx={4.6} cy={-1.8} r={0.8} fill={dark} />
+      <circle cx={7.4} cy={-1.8} r={0.8} fill={dark} /></>}
+      <circle cx={6} cy={-0.2} r={0.6} fill="#C77" />
+    </g>
+  )
+}
+
+// ── Robot vacuum (Roomba). Machine motion grammar: a flat disc, a status LED that reads the mode,
+//    a front bumper. Minimal animation by nature (calm-tech friendly). ──
+function VacuumSprite({ mode, reducedMotion, reaction }) {
+  const body = '#3A3F44', top = '#4E555C', rim = '#23262A'
+  // LED colour reads the mode (honest: same mode the barometer chose)
+  const led = mode === PET_MODES.HIDE ? '#E24B4A'
+    : mode === PET_MODES.ALERT ? '#E24B4A'
+    : mode === PET_MODES.NAP ? '#E8A317'
+    : mode === PET_MODES.CELEBRATE ? '#19C3E6'
+    : '#1D9E75'
+  const docked = mode === PET_MODES.NAP
+  const blink = (mode === PET_MODES.ALERT) && !reducedMotion
+  // Machine grammar for legible per-mode SILHOUETTES (not LED-only): nap docks + dims; wander shows a
+  // sweep trail; excited adds a dust puff; hide tilts + dims (backed off). All static (calm).
+  const tilt = mode === PET_MODES.HIDE ? -18 : 0 // more visible "backed off" lean (game-feel polish)
+  const dim = (mode === PET_MODES.NAP || mode === PET_MODES.HIDE) ? 0.66 : 1
+  const sweeping = mode === PET_MODES.WANDER || mode === PET_MODES.EXCITED
+  const puffing = mode === PET_MODES.EXCITED
+  return (
+    <g aria-hidden="true" data-cozy-pet-reaction={reaction ? 'vacuum' : undefined}>
+      {reaction && (
+        <g transform="translate(6, 4)" stroke="#9aa1a8" strokeWidth="0.8" strokeLinecap="round">
+          <g style={reducedMotion ? undefined : { animation: 'cozy-vacuum-brush 720ms ease-out' }}>
+            <path d="M -2 0 h 4 M 0 -2 v 4 M -1.4 -1.4 l 2.8 2.8" />
+          </g>
+        </g>
+      )}
+      {docked && /* charging dock */ <rect x={-7} y={3} width={14} height={2.4} rx={1} fill="#555" opacity="0.8" />}
+      {/* motion sweep lines trailing behind (disc faces +x, so the trail is to the left) */}
+      {sweeping && (
+        <g stroke="#9aa1a8" strokeWidth="0.7" opacity="0.5" strokeLinecap="round">
+          <line x1={-9} y1={-1.6} x2={-12.5} y2={-1.6} />
+          <line x1={-9} y1={1.6} x2={-13} y2={1.6} />
+        </g>
+      )}
+      {/* dust puff kicked up when zipping (excited) */}
+      {puffing && (
+        <g fill="#BCB3A8" opacity="0.5">
+          <circle cx={-11} cy={2.6} r={1.4} />
+          <circle cx={-13.2} cy={1.6} r={1} />
+        </g>
+      )}
+      {/* disc body — tilts + dims when hiding (retreating) */}
+      <g transform={tilt ? `rotate(${tilt})` : undefined} opacity={dim}>
+        <ellipse cx={0} cy={1} rx={8} ry={5.4} fill={body} stroke={rim} strokeWidth="0.8" />
+        <ellipse cx={0} cy={0.2} rx={5.4} ry={3.4} fill={top} />
+        {/* front bumper (faces +x; parent flips via scale for direction) */}
+        <path d="M 6 -2 a 6 5.4 0 0 1 0 6" stroke={rim} strokeWidth="1.2" fill="none" opacity="0.7" />
+      </g>
+      {/* status LED */}
+      <circle cx={0} cy={0} r={1.5} fill={led} opacity={mode === PET_MODES.HIDE ? 0.6 : 0.95}
+        style={blink ? { animation: 'pet-snooze 0.8s steps(2,end) infinite' } : undefined} />    </g>
+  )
+}
+
+// ── Dog. Like the cat but doggier: floppy ears, snout, a wagging tail when excited/celebrating. ──
+function DogSprite({ mode, reducedMotion, reaction }) {
+  const fur = '#A6713C', dark = '#6E4A28', belly = '#E0C29A'
+  const tail = reaction && !reducedMotion
+    ? { animation: 'cozy-pet-tail 720ms ease-in-out', transformOrigin: mode === PET_MODES.NAP ? '8.4px 0.4px' : '-7px 0px' }
+    : undefined
+  if (mode === PET_MODES.NAP) {
+    return (
+      <g aria-hidden="true" data-cozy-pet-reaction={reaction ? 'dog' : undefined}>
+        <ellipse cx={0} cy={0} rx={9.5} ry={5.5} fill={fur} />
+        <ellipse cx={0} cy={1.6} rx={6} ry={3} fill={belly} opacity="0.5" />
+        <circle cx={-6.5} cy={-0.5} r={3.8} fill={fur} />
+        <path d="M -9.4 -1.6 q -2 1 -1 3.4" stroke={dark} strokeWidth="2" fill="none" strokeLinecap="round" />{/* floppy ear */}
+        <path d="M -7.6 -0.6 q 1 0.8 2 0" stroke={dark} strokeWidth="0.5" fill="none" />
+        <path d="M 8.4 0.4 q 4.4 0 3.6 -3.4" stroke={fur} strokeWidth="2.6" fill="none" strokeLinecap="round" style={tail} />      </g>
+    )
+  }
+  if (mode === PET_MODES.HIDE) {
+    return (
+      <g aria-hidden="true">
+        <ellipse cx={0} cy={1} rx={8.5} ry={3.8} fill={fur} />
+        <circle cx={6} cy={0} r={3.6} fill={fur} />
+        <path d="M 3.4 -1.6 q -2 0.6 -1.6 2.6" stroke={dark} strokeWidth="1.8" fill="none" strokeLinecap="round" />{/* ear tucked */}
+        <circle cx={5} cy={-0.2} r={0.7} fill={dark} />
+        <circle cx={7.4} cy={-0.2} r={0.7} fill={dark} />
+        <ellipse cx={8.6} cy={1} rx={1.4} ry={1} fill={dark} />{/* snout */}
+        <path d="M -8.4 1.2 q -2.6 1 -1.6 3" stroke={fur} strokeWidth="2.2" fill="none" strokeLinecap="round" />
+      </g>
+    )
+  }
+  if (mode === PET_MODES.ALERT) {
+    return (
+      <g aria-hidden="true">
+        <path d="M -7.4 1 q -4 2 -3 4" stroke={fur} strokeWidth="2.4" fill="none" strokeLinecap="round" />
+        <ellipse cx={0} cy={1} rx={5.8} ry={5} fill={fur} />
+        <ellipse cx={0} cy={2.6} rx={3} ry={2.4} fill={belly} opacity="0.55" />
+        <circle cx={2} cy={-4} r={4} fill={fur} />
+        <path d="M -1.4 -5.4 q -2.4 -0.6 -2.6 2.4" stroke={dark} strokeWidth="2" fill="none" strokeLinecap="round" />{/* perked floppy ear */}
+        <circle cx={0.8} cy={-4.2} r={1} fill={dark} />
+        <circle cx={3.6} cy={-4.2} r={1} fill={dark} />
+        <ellipse cx={4} cy={-2.6} rx={1.4} ry={1} fill={dark} />      </g>
+    )
+  }
+  if (mode === PET_MODES.CELEBRATE) {
+    return (
+      <g aria-hidden="true">
+        <path d="M -7 0 q -4 -3 -1 -8" stroke={fur} strokeWidth="2.6" fill="none" strokeLinecap="round" />{/* tail up/wag */}
+        <ellipse cx={-1} cy={1} rx={7.2} ry={4.2} fill={fur} />
+        <ellipse cx={-1} cy={2.6} rx={4} ry={2} fill={belly} opacity="0.55" />
+        <rect x={-4} y={4} width={1.8} height={3} rx={0.9} fill={dark} />
+        <rect x={2} y={4} width={1.8} height={3} rx={0.9} fill={dark} />
+        <circle cx={6} cy={-2} r={4.2} fill={fur} />
+        <path d="M 3 -3.6 q -2.2 1 -1.2 3.4" stroke={dark} strokeWidth="2" fill="none" strokeLinecap="round" />
+        <ellipse cx={8.6} cy={-1.4} rx={1.6} ry={1.1} fill={dark} />
+        <path d="M 8.4 -0.4 l 0 2" stroke="#D9536B" strokeWidth="1" strokeLinecap="round" />{/* tongue */}      </g>
+    )
+  }
+  const excited = mode === PET_MODES.EXCITED
+  return (
+    <g aria-hidden="true" data-cozy-pet-reaction={reaction ? 'dog' : undefined}>
+      {excited
+        ? <path d="M -7 0 q -5 -2 -3.6 -7" stroke={fur} strokeWidth="2.4" fill="none" strokeLinecap="round" style={tail} />
+        : <path d="M -7 0 q -5 1 -4.6 -3" stroke={fur} strokeWidth="2.4" fill="none" strokeLinecap="round" style={tail} />}
+      <ellipse cx={-1} cy={1} rx={7.2} ry={4.2} fill={fur} />
+      <ellipse cx={-1} cy={2.6} rx={4} ry={2} fill={belly} opacity="0.55" />
+      <rect x={-4} y={4} width={1.8} height={3} rx={0.9} fill={dark} />
+      <rect x={2} y={4} width={1.8} height={3} rx={0.9} fill={dark} />
+      <circle cx={6} cy={-1.5} r={4.2} fill={fur} />
+      <path d="M 3 -3.4 q -2.2 1 -1.2 3.4" stroke={dark} strokeWidth="2" fill="none" strokeLinecap="round" />{/* floppy ear */}
+      <circle cx={5} cy={-1.8} r={0.8} fill={dark} />
+      <circle cx={7.6} cy={-1.8} r={0.8} fill={dark} />
+      <ellipse cx={8.8} cy={-0.4} rx={1.5} ry={1.1} fill={dark} />{/* snout */}
+    </g>
+  )
+}
+
+// ── Rabbit. Tall upright ears (the read); hops (motion grammar). ──
+function RabbitSprite({ mode }) {
+  const fur = '#E3DED6', dark = '#BEB6AB', belly = '#F4F0EA', pink = '#E59AA8'
+  if (mode === PET_MODES.NAP) {
+    return (
+      <g aria-hidden="true">
+        <ellipse cx={0} cy={1} rx={8.5} ry={5} fill={fur} />
+        <ellipse cx={0} cy={2} rx={5} ry={2.6} fill={belly} opacity="0.55" />
+        <circle cx={-6} cy={-0.5} r={3.4} fill={fur} />
+        <path d="M -7.6 -0.6 q 1 0.7 1.9 0" stroke={dark} strokeWidth="0.5" fill="none" />
+        <ellipse cx={-7.5} cy={-3.5} rx={1} ry={2.6} transform="rotate(-20 -7.5 -3.5)" fill={fur} />{/* folded ear */}
+        <circle cx={8} cy={0} r={1.6} fill={belly} />{/* puff tail */}
+      </g>
+    )
+  }
+  if (mode === PET_MODES.HIDE) {
+    return (
+      <g aria-hidden="true">
+        <ellipse cx={0} cy={2} rx={7.5} ry={3.4} fill={fur} />
+        <circle cx={5.5} cy={0.6} r={3.2} fill={fur} />
+        <ellipse cx={4} cy={-2.4} rx={0.9} ry={2.2} transform="rotate(18 4 -2.4)" fill={fur} />{/* ears back */}
+        <ellipse cx={6.8} cy={-2.4} rx={0.9} ry={2.2} transform="rotate(28 6.8 -2.4)" fill={fur} />
+        <circle cx={4.6} cy={0.4} r={0.7} fill={dark} /><circle cx={6.6} cy={0.4} r={0.7} fill={dark} />
+      </g>
+    )
+  }
+  // upright (wander/excited/alert/celebrate)
+  return (
+    <g aria-hidden="true">
+      <circle cx={8} cy={1} r={1.8} fill={belly} />{/* tail */}
+      <ellipse cx={0} cy={2} rx={5.5} ry={4.5} fill={fur} />
+      <ellipse cx={0} cy={3.2} rx={3} ry={2.4} fill={belly} opacity="0.6" />
+      <circle cx={2} cy={-2.5} r={3.6} fill={fur} />
+      {/* tall ears */}
+      <ellipse cx={0.4} cy={-7} rx={1.1} ry={3.6} transform="rotate(-8 0.4 -7)" fill={fur} />
+      <ellipse cx={0.4} cy={-7} rx={0.5} ry={2.6} transform="rotate(-8 0.4 -7)" fill={pink} opacity="0.6" />
+      <ellipse cx={3.8} cy={-7} rx={1.1} ry={3.6} transform="rotate(8 3.8 -7)" fill={fur} />
+      <ellipse cx={3.8} cy={-7} rx={0.5} ry={2.6} transform="rotate(8 3.8 -7)" fill={pink} opacity="0.6" />
+      <circle cx={0.8} cy={-2.6} r={0.8} fill={dark} /><circle cx={3.4} cy={-2.6} r={0.8} fill={dark} />
+      <circle cx={2.1} cy={-1.2} r={0.6} fill={pink} />
+    </g>
+  )
+}
+
+// ── Bird. Small round body, beak + wing; quick flits. ──
+function BirdSprite({ mode }) {
+  const body = '#5BA3D0', dark = '#3A7BA8', belly = '#CDE6F4', beak = '#E8A23C'
+  if (mode === PET_MODES.NAP) {
+    return (
+      <g aria-hidden="true">
+        <ellipse cx={0} cy={0} rx={6} ry={5} fill={body} />{/* puffed up */}
+        <ellipse cx={0} cy={1.5} rx={3.6} ry={2.6} fill={belly} opacity="0.6" />
+        <path d="M -5.5 0.5 q 1 1 2.2 0" stroke={dark} strokeWidth="0.5" fill="none" />{/* tucked head, closed eye */}
+      </g>
+    )
+  }
+  if (mode === PET_MODES.HIDE) {
+    return (
+      <g aria-hidden="true">
+        <ellipse cx={0} cy={2} rx={6} ry={3.4} fill={body} />
+        <circle cx={4} cy={0.6} r={2.6} fill={body} />
+        <circle cx={4.4} cy={0.2} r={0.7} fill={dark} />
+        <path d="M 6.4 0.6 l 2 -0.4 l -2 1 Z" fill={beak} />
+      </g>
+    )
+  }
+  return (
+    <g aria-hidden="true">
+      <path d="M -6 -1 l -4 1 l 4 1 Z" fill={dark} />{/* tail */}
+      <ellipse cx={0} cy={0} rx={5.2} ry={4.4} fill={body} />
+      <ellipse cx={0.5} cy={1.4} rx={3} ry={2.4} fill={belly} opacity="0.7" />
+      <path d="M -1 -1 q 4 1.5 3 4" stroke={dark} strokeWidth="1.6" fill="none" strokeLinecap="round" opacity="0.5" />{/* wing */}
+      <circle cx={4} cy={-1.5} r={3} fill={body} />
+      <circle cx={4.4} cy={-1.8} r={0.9} fill="#fff" /><circle cx={4.6} cy={-1.8} r={0.5} fill={dark} />
+      <path d="M 6.6 -1.4 l 2.6 -0.6 l -2.4 1.4 Z" fill={beak} />
+      <line x1={-1} y1={4.2} x2={-1} y2={5.6} stroke={beak} strokeWidth="0.8" />
+      <line x1={1.6} y1={4.2} x2={1.6} y2={5.6} stroke={beak} strokeWidth="0.8" />
+    </g>
+  )
+}
+
+// ── Hamster. Round chubby body, tiny ears, cheeks; scurries. ──
+function HamsterSprite({ mode }) {
+  const fur = '#D9A86B', dark = '#A8753E', belly = '#F2E4CE'
+  if (mode === PET_MODES.NAP) {
+    return (
+      <g aria-hidden="true">
+        <ellipse cx={0} cy={1} rx={7.5} ry={5} fill={fur} />
+        <ellipse cx={0} cy={2.2} rx={4.6} ry={2.8} fill={belly} opacity="0.6" />
+        <path d="M -5.8 0.6 q 1 0.9 2 0" stroke={dark} strokeWidth="0.5" fill="none" />
+      </g>
+    )
+  }
+  if (mode === PET_MODES.HIDE) {
+    return (
+      <g aria-hidden="true">
+        <ellipse cx={0} cy={2} rx={7} ry={3.6} fill={fur} />
+        <circle cx={5} cy={0.8} r={3} fill={fur} />
+        <circle cx={4.6} cy={0.4} r={0.7} fill={dark} /><circle cx={6.6} cy={0.4} r={0.7} fill={dark} />
+      </g>
+    )
+  }
+  return (
+    <g aria-hidden="true">
+      <ellipse cx={0} cy={1} rx={6.5} ry={5.5} fill={fur} />
+      <ellipse cx={0.5} cy={2.5} rx={4} ry={3} fill={belly} opacity="0.7" />
+      {/* tiny ears */}
+      <circle cx={-2} cy={-4.4} r={1.6} fill={fur} /><circle cx={3} cy={-4.4} r={1.6} fill={fur} />
+      <circle cx={-2} cy={-4.4} r={0.8} fill={dark} opacity="0.5" /><circle cx={3} cy={-4.4} r={0.8} fill={dark} opacity="0.5" />
+      <circle cx={-1.4} cy={-1.4} r={0.9} fill={dark} /><circle cx={2.4} cy={-1.4} r={0.9} fill={dark} />
+      {/* cheek puffs */}
+      <circle cx={-3.6} cy={0.6} r={1.8} fill={belly} opacity="0.8" /><circle cx={4.4} cy={0.6} r={1.8} fill={belly} opacity="0.8" />
+      <circle cx={0.5} cy={-0.2} r={0.5} fill={dark} />
+      {/* little hands */}
+      <circle cx={-1} cy={4.6} r={1} fill={belly} /><circle cx={2} cy={4.6} r={1} fill={belly} />
+    </g>
+  )
+}
+
+export default function PetSprite({ type, mode, reducedMotion, reaction = false }) {
+  // Defense in depth: genuine attention/celebration poses always win, even if a
+  // caller still holds a click reaction during the same render as a mode change.
+  const calmReaction = reaction && (mode === PET_MODES.WANDER || mode === PET_MODES.NAP || mode === PET_MODES.EXCITED)
+  if (type === 'vacuum') return <VacuumSprite mode={mode} reducedMotion={reducedMotion} reaction={calmReaction} />
+  if (type === 'dog') return <DogSprite mode={mode} reducedMotion={reducedMotion} reaction={calmReaction} />
+  if (type === 'rabbit') return <RabbitSprite mode={mode} />
+  if (type === 'bird') return <BirdSprite mode={mode} />
+  if (type === 'hamster') return <HamsterSprite mode={mode} />
+  return <CatSprite mode={mode} reducedMotion={reducedMotion} reaction={calmReaction} />
+}

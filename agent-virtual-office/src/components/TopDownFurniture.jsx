@@ -1,0 +1,523 @@
+import React, { useEffect, useRef, useState } from 'react'
+import { classifyMood } from '../systems/classify.js'
+import { useOfficeStore } from '../systems/store.js'
+import { t, useLocale } from '../i18n.js'
+import { useCozyInteractions } from './useCozyInteractions.js'
+
+// All furniture below is wrapped in React.memo. PixelOffice re-renders on every minute/
+// hour clock tick, every activeEvent/activeWorkflow change, and every agentOrderSignature
+// change (an agent stepping). The furniture's props are static literals (or, for
+// WallWindow/DeskLamp, the slow-changing `hour`), so on the overwhelming majority of those
+// re-renders no furniture prop changes — memo skips re-executing each component and
+// re-reconciling its SVG subtree. Clock is intentionally NOT memoized: its `minute` prop
+// changes on every tick, so memo could never hit.
+
+// ─── Desk (top-down view) ────────────────────────────────────────────────
+// facing: 'down' (default, monitor at top) or 'up' (monitor at bottom, for paired desks)
+export const Desk = React.memo(function Desk({ x, y, color = '#B8864E', hasMonitor = true, coffeeCount = 0, facing = 'down' }) {
+  const W = 52, H = 34
+  const up = facing === 'up'
+  return (
+    <g>
+      {/* Chair */}
+      <rect x={x - 9} y={up ? y - H / 2 - 15 : y + H / 2 + 1} width={18} height={14} rx={6} fill="#444" opacity="0.7" />
+      <rect x={x - 6} y={up ? y - H / 2 - 11 : y + H / 2 + 2} width={12} height={8} rx={3} fill="#666" opacity="0.5" />
+      {/* Desk back edge / shelf */}
+      <rect x={x - W / 2} y={up ? y + H / 2 - 8 : y - H / 2} width={W} height={8} rx={1} fill="#7A5230" />
+      {/* Desk surface */}
+      <rect x={x - W / 2} y={up ? y - H / 2 : y - H / 2 + 8} width={W} height={H - 8} rx={1} fill={color} />
+      {/* Front edge */}
+      <rect x={x - W / 2} y={up ? y - H / 2 : y + H / 2 - 3} width={W} height={3} rx={0.5} fill="#C8965E" />
+      {/* Desk shadow */}
+      <rect x={x - W / 2 + 2} y={up ? y - H / 2 - 3 : y + H / 2} width={W - 4} height={3} rx={1} fill="rgba(0,0,0,0.07)" />
+      {/* Monitor */}
+      {hasMonitor && (
+        <g>
+          {up ? (
+            <>
+              <rect x={x - 12} y={y + H / 2 - 15} width={24} height={14} rx={1.5} fill="#1a2a3a" />
+              <rect x={x - 10} y={y + H / 2 - 13} width={20} height={10} rx={1} fill="#2d5a7e" />
+              <line x1={x - 8} y1={y + H / 2 - 11} x2={x + 5} y2={y + H / 2 - 11} stroke="#4af" strokeWidth="0.8" opacity="0.5" />
+              <line x1={x - 8} y1={y + H / 2 - 8} x2={x + 8} y2={y + H / 2 - 8} stroke="#4fa" strokeWidth="0.8" opacity="0.4" />
+            </>
+          ) : (
+            <>
+              <rect x={x - 12} y={y - H / 2 + 1} width={24} height={14} rx={1.5} fill="#1a2a3a" />
+              <rect x={x - 10} y={y - H / 2 + 3} width={20} height={10} rx={1} fill="#2d5a7e" />
+              <line x1={x - 8} y1={y - H / 2 + 5} x2={x + 5} y2={y - H / 2 + 5} stroke="#4af" strokeWidth="0.8" opacity="0.5" />
+              <line x1={x - 8} y1={y - H / 2 + 8} x2={x + 8} y2={y - H / 2 + 8} stroke="#4fa" strokeWidth="0.8" opacity="0.4" />
+              <line x1={x - 8} y1={y - H / 2 + 11} x2={x + 2} y2={y - H / 2 + 11} stroke="#fa4" strokeWidth="0.8" opacity="0.5" />
+            </>
+          )}
+        </g>
+      )}
+      {/* Coffee cups */}
+      {coffeeCount >= 1 && <CoffeeCup x={x + 16} y={y - 4} />}
+      {coffeeCount >= 2 && <CoffeeCup x={x + 16} y={y + 6} steaming={false} />}
+      {coffeeCount >= 3 && <CoffeeCup x={x + 21} y={y} steaming={false} />}
+    </g>
+  )
+})
+
+// ─── Coffee Cup ──────────────────────────────────────────────────────────
+export const CoffeeCup = React.memo(function CoffeeCup({ x, y, steaming = true }) {
+  return (
+    <g>
+      <rect x={x} y={y} width={6} height={7} rx={1} fill="#F5E6D3" stroke="#D4C4B0" strokeWidth="0.5" />
+      <path d={`M${x + 6},${y + 2} Q${x + 9},${y + 3} ${x + 6},${y + 5}`} fill="none" stroke="#D4C4B0" strokeWidth="0.6" />
+      <ellipse cx={x + 3} cy={y} rx={3} ry={1.2} fill="#6B4226" />
+      {steaming && (
+        <g opacity="0.5">
+          <path d={`M${x + 2},${y - 2} Q${x + 3},${y - 5} ${x + 2},${y - 8}`} fill="none" stroke="#bbb" strokeWidth="0.5">
+            <animate attributeName="opacity" values="0.2;0.6;0.2" dur="2.2s" repeatCount="indefinite" />
+          </path>
+          <path d={`M${x + 4},${y - 2} Q${x + 5},${y - 6} ${x + 4},${y - 9}`} fill="none" stroke="#bbb" strokeWidth="0.4">
+            <animate attributeName="opacity" values="0.4;0.1;0.4" dur="1.8s" repeatCount="indefinite" />
+          </path>
+        </g>
+      )}
+    </g>
+  )
+})
+
+// ─── Bookshelf ───────────────────────────────────────────────────────────
+export const Bookshelf = React.memo(function Bookshelf({ x, y, width = 70, rows = 2 }) {
+  const BOOK_COLORS = ['#E24B4A', '#378ADD', '#1D9E75', '#BA7517', '#7F77DD', '#D85A30', '#5DCAA5', '#FF9E9E', '#FFE066']
+  const H = rows * 17
+  return (
+    <g>
+      <rect x={x} y={y} width={width} height={H + 6} rx={1} fill="#8B6538" />
+      <rect x={x + 2} y={y + 2} width={width - 4} height={H + 2} rx={1} fill="#A07848" />
+      {Array.from({ length: rows }).map((_, row) => {
+        const ry = y + 4 + row * 17
+        let bx = x + 4
+        const items = []
+        let i = 0
+        while (bx < x + width - 8) {
+          const c = BOOK_COLORS[(row * 5 + i) % BOOK_COLORS.length]
+          const bw = 5 + (i % 3 === 0 ? 3 : 0)
+          if (bx + bw > x + width - 6) break
+          items.push(<rect key={i} x={bx} y={ry} width={bw} height={13} fill={c} opacity="0.88" />)
+          bx += bw + 1
+          i++
+        }
+        return (
+          <g key={row}>
+            {items}
+            <rect x={x + 2} y={ry + 14} width={width - 4} height={2} fill="#7A5228" />
+          </g>
+        )
+      })}
+    </g>
+  )
+})
+
+// ─── Plant ───────────────────────────────────────────────────────────────
+export const Plant = React.memo(function Plant({ x, y }) {
+  const enabled = useCozyInteractions()
+  const reducedMotion = useOfficeStore((s) => s.reducedMotion)
+  useLocale()
+  const [reaction, setReaction] = useState(0)
+  const timer = useRef(null)
+  const serial = useRef(0)
+  useEffect(() => {
+    if (!enabled) { clearTimeout(timer.current); setReaction(0) }
+    return () => clearTimeout(timer.current)
+  }, [enabled])
+  const react = () => {
+    if (!enabled) return
+    clearTimeout(timer.current)
+    setReaction(++serial.current)
+    timer.current = setTimeout(() => setReaction(0), 720)
+  }
+  const active = enabled && reaction !== 0
+  return (
+    <g
+      data-cozy-plant={enabled ? '1' : undefined}
+      role={enabled ? 'button' : undefined}
+      tabIndex={enabled ? 0 : undefined}
+      aria-label={enabled ? t('cozy.plantAria', 'Gently sway plant leaves') : undefined}
+      style={enabled ? { cursor: 'pointer' } : undefined}
+      onClick={enabled ? react : undefined}
+      onKeyDown={enabled ? (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          if (!event.repeat) react()
+        }
+      } : undefined}
+    >
+      {enabled && <rect data-cozy-hit-area="1" x={x - 14} y={y - 23} width={28} height={34}
+        fill="transparent" pointerEvents="all" />}
+      {active && <ellipse data-cozy-feedback="plant" cx={x} cy={y - 6} rx={13} ry={17}
+        fill="none" stroke="#FFD887" strokeWidth={1.5} pointerEvents="none" />}
+      <rect x={x - 5} y={y} width={10} height={9} rx={2} fill="#C4724B" />
+      <rect x={x - 6} y={y} width={12} height={3} rx={1} fill="#A55A3A" />
+      <g key={reaction} data-cozy-leaves={active ? 'active' : undefined}
+        style={active ? (reducedMotion
+          ? { filter: 'brightness(1.25)' }
+          : { animation: 'cozy-plant-sway 720ms ease-in-out', transformOrigin: `${x}px ${y}px` }) : undefined}>
+      <ellipse cx={x - 4} cy={y - 7} rx={4.5} ry={5.5} fill="#3D8B3D" />
+      <ellipse cx={x + 4} cy={y - 8} rx={4} ry={5} fill="#4CAF50" />
+      <ellipse cx={x} cy={y - 10} rx={3.5} ry={5} fill="#388E3C" />
+      <ellipse cx={x - 2} cy={y - 12} rx={2.5} ry={3.5} fill="#66BB6A" />
+      </g>
+    </g>
+  )
+})
+
+// ─── Couch ───────────────────────────────────────────────────────────────
+export const Couch = React.memo(function Couch({ x, y, width = 80, color = '#B97A4E' }) {
+  return (
+    <g>
+      <rect x={x} y={y} width={width} height={34} rx={5} fill={color} />
+      <rect x={x + 4} y={y + 9} width={width / 2 - 8} height={21} rx={3} fill="#CC8C5E" />
+      <rect x={x + width / 2 + 4} y={y + 9} width={width / 2 - 8} height={21} rx={3} fill="#CC8C5E" />
+      <rect x={x} y={y} width={width} height={11} rx={4} fill="#9A5E38" />
+      <rect x={x} y={y + 9} width={10} height={25} rx={3} fill="#A86B44" />
+      <rect x={x + width - 10} y={y + 9} width={10} height={25} rx={3} fill="#A86B44" />
+    </g>
+  )
+})
+
+// ─── Round Coffee Table ───────────────────────────────────────────────────
+export const RoundTable = React.memo(function RoundTable({ x, y, r = 22 }) {
+  return (
+    <g>
+      <circle cx={x} cy={y} r={r} fill="#C8965E" stroke="#A07040" strokeWidth="1.5" />
+      <circle cx={x} cy={y} r={r - 4} fill="#D4A870" opacity="0.35" />
+      <ellipse cx={x} cy={y} rx={r - 8} ry={r - 10} fill="none" stroke="#B07840" strokeWidth="0.5" opacity="0.4" />
+    </g>
+  )
+})
+
+// ─── Meeting Table ────────────────────────────────────────────────────────
+export const MeetingTable = React.memo(function MeetingTable({ x, y, w = 90, h = 50 }) {
+  return (
+    <g>
+      <rect x={x - w / 2} y={y - h / 2} width={w} height={h} rx={8} fill="#C8965E" stroke="#A07040" strokeWidth="1.5" />
+      <rect x={x - w / 2 + 6} y={y - h / 2 + 6} width={w - 12} height={h - 12} rx={5} fill="#D4A870" opacity="0.35" />
+      {/* Meeting chairs */}
+      {[-1, 1].map((side) =>
+        [-1, 0, 1].map((pos) => (
+          <rect
+            key={`${side}-${pos}`}
+            x={x + pos * 24 - 7}
+            y={side === -1 ? y - h / 2 - 12 : y + h / 2 + 1}
+            width={14} height={10} rx={4}
+            fill="#555" opacity="0.65"
+          />
+        ))
+      )}
+    </g>
+  )
+})
+
+// ─── Coffee / Vending Machine ─────────────────────────────────────────────
+// AVO-193: `busy` is the machine's answer to a click it cannot serve — every agent is genuinely
+// working, so AVO-191 refuses to stage a tea break and the click was landing in total silence.
+// The MACHINE reacts (screen + steam); no agent is moved and nothing is claimed about their work.
+// `busyKey` remounts the steam so a second click restarts it. The steam is a CSS keyframes
+// animation (`coffee-steam`, src/index.css), NOT SMIL: an <animate begin="0s"> inserted after load
+// counts from document start and renders already-finished. Reduced motion keeps both signals and
+// drops the movement, like the pet-pop site in PixelOffice.
+export const CoffeeMachine = React.memo(function CoffeeMachine({ x, y, busy = false, busyKey = 0, reducedMotion = false }) {
+  return (
+    <g>
+      <rect x={x} y={y} width={18} height={26} rx={2} fill="#5A4A3E" />
+      <rect x={x + 2} y={y + 2} width={14} height={10} rx={1} fill="#222" />
+      <rect x={x + 3} y={y + 3} width={12} height={8} rx={0.5} fill="#0a2a1a" />
+      <text x={x + 9} y={y + 9} textAnchor="middle" fontSize="4" fill="#0f0" fontFamily="monospace">{busy ? 'BUSY' : 'CAFE'}</text>
+      {busy && (
+        <g key={busyKey} opacity="0.85" data-coffee-busy="1">
+          {[0, 1, 2].map((i) => (
+            <path key={i} d={`M${x + 5 + i * 4} ${y - 1} q -2 -4 0 -8 q 2 -4 0 -8`} fill="none" stroke="#FFFFFF" strokeWidth="1.3" strokeLinecap="round"
+              style={reducedMotion ? undefined : { animation: `coffee-steam 1.6s ease-out ${i * 0.15}s both` }} />
+          ))}
+        </g>
+      )}
+      <circle cx={x + 9} cy={y + 18} r={3.5} fill="#E24B4A">
+        <animate attributeName="opacity" values="0.6;1;0.6" dur="2.5s" repeatCount="indefinite" />
+      </circle>
+      <rect x={x + 2} y={y + 23} width={14} height={3} rx={1} fill="#888" />
+    </g>
+  )
+})
+
+// ─── Water Cooler ─────────────────────────────────────────────────────────
+export const WaterCooler = React.memo(function WaterCooler({ x, y }) {
+  return (
+    <g>
+      <rect x={x - 5} y={y + 6} width={10} height={14} rx={2} fill="#D8CDBE" />
+      <ellipse cx={x} cy={y + 6} rx={5} ry={6} fill="#B0D4F0" stroke="#88B4D8" strokeWidth="0.8" />
+      <ellipse cx={x} cy={y} rx={3} ry={4} fill="#D8EEFF" opacity="0.8" />
+      <circle cx={x - 2} cy={y + 14} r={1.5} fill="#E24B4A" opacity="0.7" />
+      <circle cx={x + 2} cy={y + 14} r={1.5} fill="#378ADD" opacity="0.7" />
+    </g>
+  )
+})
+
+// ─── Gate / Security Booth ────────────────────────────────────────────────
+export const GateBooth = React.memo(function GateBooth({ x, y }) {
+  return (
+    <g>
+      <rect x={x - 16} y={y - 10} width={32} height={22} rx={3} fill="#888" stroke="#666" strokeWidth="1" />
+      <rect x={x - 14} y={y - 8} width={28} height={18} rx={2} fill="#AAA" />
+      <rect x={x + 16} y={y - 6} width={28} height={3} rx={1.5} fill="#E24B4A" stroke="#C43" strokeWidth="0.5" />
+      <rect x={x - 44} y={y - 6} width={28} height={3} rx={1.5} fill="#E24B4A" stroke="#C43" strokeWidth="0.5" />
+      <rect x={x - 16} y={y - 16} width={32} height={7} rx={1} fill="#E24B4A" />
+      <text x={x} y={y - 11} textAnchor="middle" fontSize="4.5" fill="white" fontFamily="monospace" fontWeight="bold">GATE</text>
+    </g>
+  )
+})
+
+// ─── Mood → Weather mapping ─────────────────────────────────────────────
+// #A2 delegation: the source of truth now lives in `src/systems/classify.js`
+// where mood mapping joins task/status under one standards-aligned classifier
+// (W3C Activity Streams + MCP + OT GenAI direction). This export stays so
+// PixelOffice's single import doesnt churn — and weatherSystem.test.js verifies
+// `classifyMood(mood).family` is byte-identical to the original switch for all
+// 7 documented moods. Unknown moods conservatively default to 'clear' (no
+// false-positive scary weather), matching the pre-delegation behavior.
+export function moodToWeather(mood) {
+  return classifyMood(mood).family
+}
+
+// ─── Weather Overlay (drawn inside WallWindow before the cross) ──────────
+// CSS keyframes live in src/index.css (#27 CSP fix) and are bundled by Vite
+// into the regular stylesheet — six WallWindow instances reuse the same
+// animations. reducedMotion drops all animations to static decoration only.
+function WeatherOverlay({ x, y, w, h, weather, reducedMotion }) {
+  if (weather === 'clear') return null
+
+  // Clip-path keeps raindrops / clouds inside the window pane regardless of
+  // how the parent scales. Each instance gets a unique id so multiple
+  // windows on the same page don't share clip masks. Note: <clipPath> is
+  // itself a defining element in SVG — wrapping it in <defs> adds a DOM
+  // node per WeatherOverlay (12 total when all windows have weather) with
+  // no behavioral difference, so we drop the <defs> wrapper.
+  const clipId = `weather-clip-${x}-${y}`
+
+  if (weather === 'cloudy') {
+    return (
+      <g clipPath={`url(#${clipId})`} pointerEvents="none">
+        <clipPath id={clipId}>
+          <rect x={x} y={y} width={w} height={h} rx={2} />
+        </clipPath>
+        <ellipse
+          cx={x + w / 2} cy={y + h * 0.35}
+          rx={w * 0.45} ry={h * 0.18}
+          fill="#D8DCE3" opacity="0.55"
+          style={reducedMotion ? undefined : { animation: 'weather-cloud-drift 30s linear infinite' }}
+        />
+        <ellipse
+          cx={x + w * 0.7} cy={y + h * 0.5}
+          rx={w * 0.3} ry={h * 0.14}
+          fill="#C5CAD2" opacity="0.4"
+          style={reducedMotion ? undefined : { animation: 'weather-cloud-drift 45s linear infinite reverse' }}
+        />
+      </g>
+    )
+  }
+
+  // rain + thunderstorm share raindrops; thunderstorm adds lightning flash overlay.
+  // Stroke / opacity tuned for daytime visibility (sky #87CEEB) — the prior light slate
+  // #A4BCD6 at 0.7 opacity was nearly invisible against the day sky (~1.1:1 contrast)
+  // while looking fine against the night sky. The mid-slate #5478A0 + 0.85 opacity
+  // hits ~2.6:1 in day and ~6:1 at night — still subtle enough to read as "drizzle"
+  // rather than "downpour" and to not fight with the foreground office activity.
+  const drops = []
+  const dropCount = 5
+  for (let i = 0; i < dropCount; i++) {
+    const dx = x + (w * (i + 0.5)) / dropCount
+    const delay = (i * 0.18).toFixed(2)
+    drops.push(
+      <line
+        key={i}
+        x1={dx} y1={y} x2={dx - 2} y2={y + h}
+        stroke="#5478A0" strokeWidth="0.7" strokeLinecap="round" opacity="0.85"
+        style={reducedMotion ? undefined : {
+          animation: `weather-raindrop-fall 0.9s linear infinite`,
+          animationDelay: `${delay}s`,
+          transformOrigin: `${dx}px ${y + h / 2}px`,
+        }}
+      />
+    )
+  }
+
+  return (
+    <g clipPath={`url(#${clipId})`} pointerEvents="none">
+      <clipPath id={clipId}>
+        <rect x={x} y={y} width={w} height={h} rx={2} />
+      </clipPath>
+      {drops}
+      {weather === 'thunderstorm' && (
+        <rect
+          x={x} y={y} width={w} height={h}
+          fill="#F8F4DC" opacity="0"
+          style={reducedMotion ? undefined : { animation: 'weather-lightning-flash 5s ease-in-out infinite' }}
+        />
+      )}
+    </g>
+  )
+}
+
+// ─── Wall Window ─────────────────────────────────────────────────────────
+export const WallWindow = React.memo(function WallWindow({ x, y, w = 42, h = 26, hour = 12, weather = 'clear', reducedMotion = false }) {
+  const isNight = hour >= 19 || hour < 6
+  const sky = hour >= 20 ? '#0a0a2a' : hour >= 19 ? '#0f1535' : hour >= 17 ? '#FF8844' : hour >= 7 ? '#87CEEB' : '#0a0a2a'
+  return (
+    <g>
+      <rect x={x} y={y} width={w} height={h} rx={2} fill={sky} stroke="#AAA" strokeWidth="1.5" />
+      {/* Stars at night */}
+      {isNight && (
+        <g>
+          <circle cx={x + 8} cy={y + 5} r={0.8} fill="#fff" opacity="0.7">
+            <animate attributeName="opacity" values="0.4;0.9;0.4" dur="3s" repeatCount="indefinite" />
+          </circle>
+          <circle cx={x + w - 10} cy={y + 8} r={0.6} fill="#fff" opacity="0.5">
+            <animate attributeName="opacity" values="0.3;0.7;0.3" dur="2.5s" repeatCount="indefinite" />
+          </circle>
+          <circle cx={x + w / 2 + 5} cy={y + 4} r={0.5} fill="#fff" opacity="0.4" />
+          <circle cx={x + 14} cy={y + h - 8} r={0.6} fill="#fff" opacity="0.6">
+            <animate attributeName="opacity" values="0.5;0.8;0.5" dur="4s" repeatCount="indefinite" />
+          </circle>
+          {/* Moon (only in some windows to avoid repetition) */}
+          {(Math.round(x) % 200 < 100) && (
+            <g>
+              <circle cx={x + w - 8} cy={y + 6} r={4} fill="#F0E8C0" opacity="0.9" />
+              <circle cx={x + w - 6} cy={y + 5} r={3.5} fill={sky} />
+            </g>
+          )}
+        </g>
+      )}
+      {/* Weather overlay (rain/cloudy/thunderstorm) — drawn under the window cross
+          so the muntins remain visible. Static decoration when reducedMotion is on. */}
+      <WeatherOverlay x={x} y={y} w={w} h={h} weather={weather} reducedMotion={reducedMotion} />
+      {/* Window cross */}
+      <line x1={x + w / 2} y1={y} x2={x + w / 2} y2={y + h} stroke="rgba(255,255,255,0.25)" strokeWidth="1" />
+      <line x1={x} y1={y + h / 2} x2={x + w} y2={y + h / 2} stroke="rgba(255,255,255,0.25)" strokeWidth="1" />
+      {/* Moonlight spill on floor at night */}
+      {isNight && (
+        <polygon
+          points={`${x + 3},${y + h + 2} ${x + w - 3},${y + h + 2} ${x + w + 6},${y + h + 18} ${x - 6},${y + h + 18}`}
+          fill="#8090C0" opacity="0.04"
+        />
+      )}
+    </g>
+  )
+})
+
+// ─── Desk Lamp (visible at night) ────────────────────────────────────────
+export const DeskLamp = React.memo(function DeskLamp({ x, y, on = true }) {
+  if (!on) return null
+  return (
+    <g>
+      {/* Warm glow cone */}
+      <polygon
+        points={`${x},${y} ${x - 18},${y + 22} ${x + 18},${y + 22}`}
+        fill="#FFE4A0" opacity="0.12"
+      />
+      <ellipse cx={x} cy={y + 22} rx={18} ry={6} fill="#FFE4A0" opacity="0.06" />
+      {/* Lamp arm */}
+      <line x1={x + 8} y1={y + 8} x2={x + 3} y2={y - 2} stroke="#888" strokeWidth="1.2" strokeLinecap="round" />
+      {/* Lamp shade */}
+      <path d={`M${x - 4},${y} Q${x},${y - 3} ${x + 4},${y}`} fill="#555" stroke="#444" strokeWidth="0.5" />
+      {/* Bulb glow */}
+      <circle cx={x} cy={y + 1} r={2} fill="#FFD060" opacity="0.9">
+        <animate attributeName="opacity" values="0.8;1;0.8" dur="4s" repeatCount="indefinite" />
+      </circle>
+    </g>
+  )
+})
+
+// ─── Whiteboard ───────────────────────────────────────────────────────────
+export const Whiteboard = React.memo(function Whiteboard({ x, y, w = 65, h = 42 }) {
+  return (
+    <g>
+      <rect x={x} y={y} width={w} height={h} rx={2} fill="#F8F8F0" stroke="#BBB" strokeWidth="1.5" />
+      <line x1={x + 5} y1={y + 10} x2={x + 45} y2={y + 10} stroke="#378ADD" strokeWidth="1.5" opacity="0.7" />
+      <line x1={x + 5} y1={y + 18} x2={x + 58} y2={y + 18} stroke="#7F77DD" strokeWidth="1.2" opacity="0.6" />
+      <rect x={x + 5} y={y + 25} width={14} height={10} rx={1} fill="none" stroke="#1D9E75" strokeWidth="1" opacity="0.8" />
+      <rect x={x + 27} y={y + 25} width={14} height={10} rx={1} fill="none" stroke="#1D9E75" strokeWidth="1" opacity="0.8" />
+      <line x1={x + 19} y1={y + 30} x2={x + 27} y2={y + 30} stroke="#1D9E75" strokeWidth="0.8" opacity="0.8" />
+      <rect x={x + 47} y={y + 5} width={10} height={10} fill="#FFE066" opacity="0.9" />
+      <rect x={x + 50} y={y + 19} width={10} height={10} fill="#FF9E9E" opacity="0.8" />
+      <rect x={x} y={y + h} width={w} height={4} rx={0.5} fill="#CCC" />
+    </g>
+  )
+})
+
+// ─── Server Rack ──────────────────────────────────────────────────────────
+export const ServerRack = React.memo(function ServerRack({ x, y }) {
+  return (
+    <g>
+      <rect x={x} y={y} width={24} height={42} rx={2} fill="#2a2a2a" stroke="#222" strokeWidth="1" />
+      {[0, 1, 2, 3, 4].map((i) => (
+        <g key={i}>
+          <rect x={x + 2} y={y + 3 + i * 8} width={20} height={6} rx={0.5} fill="#1a1a1a" />
+          <circle cx={x + 18} cy={y + 6 + i * 8} r={1.2} fill={i % 2 === 0 ? '#0f0' : '#f80'}>
+            <animate attributeName="opacity" values="0.4;1;0.4" dur={`${1.2 + i * 0.3}s`} repeatCount="indefinite" />
+          </circle>
+        </g>
+      ))}
+    </g>
+  )
+})
+
+// ─── Clock ────────────────────────────────────────────────────────────────
+// NOT memoized: `minute` changes on every clock tick, so a memo could never hit.
+export function Clock({ x, y, r = 14, hour = 12, minute = 0 }) {
+  const hr = ((hour % 12) + minute / 60) / 12 * Math.PI * 2
+  const mn = minute / 60 * Math.PI * 2
+  return (
+    <g>
+      <circle cx={x} cy={y} r={r} fill="white" stroke="#AAA" strokeWidth="1.5" />
+      <circle cx={x} cy={y} r={1} fill="#333" />
+      {/* Tick marks */}
+      {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map((i) => {
+        const a = i / 12 * Math.PI * 2
+        const big = i % 3 === 0
+        return (
+          <line key={i}
+            x1={x + Math.sin(a) * (r - 2)} y1={y - Math.cos(a) * (r - 2)}
+            x2={x + Math.sin(a) * (r - (big ? 5 : 3))} y2={y - Math.cos(a) * (r - (big ? 5 : 3))}
+            stroke="#666" strokeWidth={big ? 1.2 : 0.6}
+          />
+        )
+      })}
+      {/* Hour hand */}
+      <line x1={x} y1={y} x2={x + Math.sin(hr) * (r * 0.55)} y2={y - Math.cos(hr) * (r * 0.55)} stroke="#333" strokeWidth="1.5" strokeLinecap="round" />
+      {/* Minute hand */}
+      <line x1={x} y1={y} x2={x + Math.sin(mn) * (r * 0.78)} y2={y - Math.cos(mn) * (r * 0.78)} stroke="#555" strokeWidth="1" strokeLinecap="round" />
+    </g>
+  )
+}
+
+// ─── Printer ──────────────────────────────────────────────────────────────
+export const Printer = React.memo(function Printer({ x, y }) {
+  return (
+    <g>
+      <rect x={x} y={y} width={20} height={14} rx={2} fill="#DDD" stroke="#BBB" strokeWidth="0.8" />
+      <rect x={x + 3} y={y - 4} width={14} height={5} rx={1} fill="#CCC" />
+      <rect x={x + 6} y={y + 11} width={8} height={5} fill="#F5F5F5" opacity="0.8" />
+      <rect x={x + 2} y={y + 5} width={16} height={2} rx={0.5} fill="#AAA" opacity="0.5" />
+    </g>
+  )
+})
+
+// ─── Rug / Carpet ─────────────────────────────────────────────────────────
+export const Rug = React.memo(function Rug({ x, y, w, h, color = '#8B6578' }) {
+  return (
+    <g>
+      <rect x={x} y={y} width={w} height={h} rx={4} fill={color} opacity="0.35" />
+      <rect x={x + 4} y={y + 4} width={w - 8} height={h - 8} rx={2} fill={color} opacity="0.2" />
+      {/* Fringe */}
+      {[0, 1, 2, 3, 4].map((i) => (
+        <line key={`t${i}`} x1={x + 10 + i * ((w - 20) / 4)} y1={y} x2={x + 10 + i * ((w - 20) / 4)} y2={y - 4} stroke={color} strokeWidth="1.5" opacity="0.5" />
+      ))}
+      {[0, 1, 2, 3, 4].map((i) => (
+        <line key={`b${i}`} x1={x + 10 + i * ((w - 20) / 4)} y1={y + h} x2={x + 10 + i * ((w - 20) / 4)} y2={y + h + 4} stroke={color} strokeWidth="1.5" opacity="0.5" />
+      ))}
+    </g>
+  )
+})

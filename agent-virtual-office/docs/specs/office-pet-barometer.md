@@ -1,0 +1,175 @@
+---
+title: Office pet (signal-driven barometer)
+status: shipped
+date: 2026-06-08
+primary_files: [src/components/OfficePet.jsx, src/components/PixelOffice.jsx, src/systems/store.js, src/components/ControlPanel.jsx, src/systems/petState.js]
+test_file: tests/petState.test.js
+related_issue: 39
+backlog_id: AVO-121
+---
+
+# Office pet — signal-driven barometer (#39 / AVO-121)
+
+## Problem
+
+#39 (competitive research: Gather.town added follow-along pets for charm) asks for a
+cute ambient companion. But a *decorative* pet that wanders/naps on its own timer is a
+**second motion source whose state is fiction** — it competes with the office's honest
+real-work signal and reproduces the "cute engine with a dashboard bolted on" failure mode
+that was deliberately deleted in the ux-vibe-rebalance wave. A 5-expert brainstorm panel
+(game-design · game-feel · calm-tech guardian · feasibility · product) independently
+converged: **keep the charm, but make the pet's behavior an HONEST readout of real office
+state** — then the toy and the truth become the same thing. Draggable agents (the
+considered alternative) was rejected 4/5: it breaks "position = real status" and fights the
+movement system.
+
+## Complete state & signal reference (the canonical map)
+
+**6 pet modes** — 4 persistent (from the honest base table) + 2 transient event-edge beats.
+**6 cosmetic types** (cat · robot-vacuum · dog · rabbit · bird · hamster) — same modes, different
+sprite + motion grammar. A **type-independent emote glyph** above the pet makes the mode legible at a
+glance for ANY skin (the poses alone are subtle at ~30px).
+
+| Mode | Kind | Real signal that triggers it | Emote | Pose / look |
+|------|------|------------------------------|-------|-------------|
+| `hide` | base | any agent `blocked` **OR** mood `stuck`/`frustrated` | ⚠ | crouched low (vacuum: tilted + dim) |
+| `nap` | base | mood `idle` (and nobody blocked) | 💤 | curled (vacuum: docked + dim) |
+| `wander` | base | mood `normal` (steady, default) | — | amble (vacuum: glide + sweep trail) |
+| `excited` | base | mood `smooth`/`rushing`/`intense` | ⚡ | trot/tail-up + hop (vacuum: + dust puff) |
+| `alert` | transient (~2.5s) | blockedCount **rose** (a NEW blocker) → also RUNS to that desk; settles into `hide` | ❗ | ears up |
+| `celebrate` | transient (~2.5s) | real `eureka`/`deploy-success` event **OR** a blocker just cleared (relief) — only when not hiding | — | hop + ✦ confetti |
+| _(click-♥)_ | cosmetic overlay | user clicks the pet (calm modes only) — NOT a real signal | ♥ | — |
+
+### Signal coverage — what maps, and what deliberately does NOT
+
+- **Moods — 7/7 fully mapped** (`MOOD_TO_PET`): normal→wander, idle→nap, smooth/rushing/intense→excited, stuck/frustrated→hide.
+- **Agent statuses (VALID_STATUSES: idle/working/blocked/done/planning)** — only **`blocked` maps DIRECTLY** (→ hide + alert + run-to-desk). `working`/`idle`/`done`/`planning` are covered **INDIRECTLY** via the mood the `moodEngine` aggregates from them; the pet has no per-single-status pose by design (it's an aggregate barometer, not a status mirror).
+- **officeLife events (~15: tea-break/standup/review-debate/dev-arch-disagree/ac-broken/…)** — the pet reacts to **only the 2 positive work-claim events** (`eureka`, `deploy-success`) plus the blocker-clear edge. The other ~13 are decorative "theater" and are **intentionally ignored** — reacting to all of them would make the pet hyperactive and mirror fiction, violating calm-tech + the honesty ethos (negative events still surface via mood→frustrated/stuck→hide).
+- **Honesty guarantee (invariant):** `blockedCount > 0 → hide` is the first branch of `derivePetState`; `celebrate`/click-♥ never show while a real blocker exists. No type/state/interaction can make the pet look happy while an agent is blocked.
+
+> This is the canonical reference. The narrative sections below (Solution / v2 / types / delight / run-vacuum) record how each piece was built and reviewed.
+
+## Solution
+
+A small ambient pet sprite (cat) rendered once in the office. Its mode is **derived from
+real aggregate office state**, mirroring the established honest `moodToWeather(mood)`
+pattern — no independent "fake" emotional life.
+
+### Pure state derivation — `src/systems/petState.js`
+
+`derivePetState({ mood, blockedCount })` → one of:
+
+| Pet mode | Real trigger | Read as |
+|----------|--------------|---------|
+| `hide`   | `blockedCount > 0` **OR** mood `stuck`/`frustrated` | something needs a human / things are rough |
+| `nap`    | mood `idle` (and nobody blocked) | the team is resting |
+| `excited`| mood `smooth`/`rushing`/`intense` | momentum — work is flowing |
+| `wander` | mood `normal` (default) | steady, ordinary activity |
+
+Priority: `hide` (real blocker) wins over everything — the pet never looks happy while an
+agent is actually blocked. This is the honesty guarantee. The mapping is a frozen table so
+it's unit-testable in isolation (same shape as `classify.js` / `moodToWeather`).
+
+A transient **`perk`** beat (a brief excited hop) is layered on real positive *events*
+(`eureka`, `deploy-success`) by subscribing to the same signals officeLife already fires —
+reusing the existing event surface, never a synthetic timer.
+
+### Sprite + movement — `src/components/OfficePet.jsx`
+
+- A compact pixel-art cat (small DOM, own colour). Modes map to pose/animation:
+  `wander` = slow drift + occasional blink; `nap` = curled with a rising "z"; `excited` =
+  faster trot / tail-up; `hide` = crouched still (ears down).
+- Movement is a **simple wander** (pick a random nearby floor point, walk straight),
+  reusing the exported `clampToFloor` / obstacle helpers from `movementSystem.js`. It does
+  **NOT** use `calculatePath` (no desk-graph routing needed) and does **NOT** touch
+  `HOME_POSITIONS`, agent coords, or the per-agent separation invariants (Protected
+  Surfaces untouched).
+- `reduced-motion`: the pet still renders in its mode-appropriate **static pose** (so it
+  keeps conveying the signal) but performs **no wander and no per-frame animation**.
+
+### Toggle — `store.js` + `ControlPanel.jsx`
+
+`officePet` boolean (default ON), persisted via a dedicated `office-pet` localStorage key
+(same lightweight pattern as `weatherEffects`/`isPaused`/`rosterMode`). ControlPanel gets a
+🐈 toggle. OFF → no pet rendered at all (zero cost). PixelOffice renders `<OfficePet>` once,
+gated by the toggle.
+
+## Acceptance criteria
+
+- AC-1 `derivePetState` returns `hide` whenever `blockedCount > 0`, regardless of mood
+  (honesty guarantee), and maps the mood enum as tabled above. (unit-tested)
+- AC-2 The pet is HONEST: it never shows `excited`/`nap` while any agent is blocked.
+- AC-3 Pet wander never lands on furniture/walls (uses `clampToFloor`/obstacle check);
+  Protected Surfaces (HOME_POSITIONS, agent coords, separation) are untouched.
+- AC-4 `reduced-motion` → static mode-pose, no wander, no animation.
+- AC-5 `officePet` toggle (default ON) persists across reload; OFF removes the pet entirely.
+- AC-6 No regression: full vitest suite green; build clean; weather/agent/roster behavior
+  unchanged.
+
+## Non-goals / deferred
+
+- Multiple pets, pet customization, pet naming, click-to-pet interactions — future.
+- Sound (the panel said sound stays off/optional; not in this MVP).
+- Draggable agents — explicitly rejected by the panel (breaks position-as-truth).
+
+## Verification
+
+- Behavioral correctness = vitest on `derivePetState` (pure) + store toggle test.
+- Pixel/visual = owner confirm per Protected-Surfaces policy + `getBoundingClientRect`
+  measurement (pet stays on floor; absent when toggled off / blocked-state pose). The
+  `preview_screenshot` transport is broken in this environment.
+
+## v2 — expert-vetted optimizations (2026-06-08, PR #63)
+
+A 4-expert research panel (game-design · game-feel · calm-tech guardian · feasibility) scoped four
+axes. Shipped increments (all honesty-preserving, Protected Surfaces untouched):
+
+- **AC-v2-1 sceneScale readability** — pure `petReadabilityScale(sceneScale)` = `clamp(1/√sceneScale,
+  1, 1.6)`; the pet stays legible when the office docks small WITHOUT encoding meaning in size
+  (size-as-signal was vetoed as dishonest/illegible). sceneScale ≥ 1 → factor 1 (unchanged).
+- **AC-v2-2 two transient states** — `alert` (a NEW-blocker EDGE: `blockedCount` rose → ears-up
+  "noticing" beat, then settles back into `hide`) and `celebrate` (real `eureka`/`deploy-success`
+  event). Both folded onto the base mode by the pure `resolvePetMode({base, alert, celebrate})`:
+  `alert` wins; `celebrate` shows ONLY when base ≠ hide. **The honesty guarantee is preserved — neither
+  can make the pet look happy during a real blocker.** Total modes now 6 (at the guardian's cap).
+- **AC-v2-3 mode change beat** — a squash-stretch `pet-pop` on every mode change (keyed remount) so
+  honest state changes are FELT, not just faded; reduced-motion → instant swap. (Originally a 220ms
+  fade; upgraded to the pop in the delight pack, PR #65.)
+- **Guardrails honored**: hide-on-blocker stays the first branch; reduced-motion suppresses all
+  motion (wander, hop, fade); transient overlays are timer-owned so a rapidly-oscillating signal
+  can't leave a state stuck on (alert uses a two-effect pattern keyed on `alert` itself).
+## delight pack (PR #65, shipped) — "obviously readable/fun" without breaking honesty
+
+A 4-expert panel (game-design · game-feel · calm-tech guardian · feasibility) judged the pet
+"tasteful wallpaper" against the owner's "obviously interesting" goal (live-measured: ~18px speck,
+subtle state diffs). Guardian reframe: push delight INTO the signal, novelty OFF the timer.
+
+- Bigger pet (`PET_BASE_SCALE` 1.7 → ~30px, pose/face readable; composes with v2 readability scale;
+  wander band tightened to keep it off desks + off the coffee-machine click target).
+- Deploy/eureka **spotlight**: a few ✦ confetti rise on the REAL celebrate event (once per event,
+  reduced-motion suppressed).
+- **Click-to-pet** ♥ — a cosmetic user-initiated beat; never changes the mode/honest reading.
+- Mode change is a squash-stretch `pet-pop` (felt, not just faded).
+- All honesty/calm-tech guardrails held (real-signal-only, reduced-motion off, no fake narrative,
+  hide-on-blocker sacred). Visual layer — verified live (pet ~30px, pop/confetti/♥). Reviewer PASS.
+
+**Run-to-blocked-desk + vacuum silhouettes (PR #66, shipped)** — on a new-blocker edge the pet trots
+to stand just below a blocked agent's desk so it POINTS AT a real blocker (pure `runTarget`; reads the
+store's published `agent.position` read-only — no HOME_POSITIONS / movement coupling; honesty held,
+alert still settles to hide). The robot-vacuum's near-identical modes got distinct static silhouettes
+(nap dock+dim · wander sweep trail · excited dust puff · hide tilt+dim).
+
+**ControlPanel ⚙ consolidation (PR #67, shipped)** — the bottom bar (~10 buttons) was decluttered: the
+cosmetic toggles (weather, pet, pet-skin), notifications, and the dev Test panel moved into a new ⚙
+settings popover (role=menu/switch/radiogroup; Esc + click-outside; en/zh-TW). Bar now: language ·
+pause · roster · Run · ⚙ · info. New store `setPetType` for the skin radiogroup. All panel-recommended
+pet/UX optimizations are now shipped.
+
+- **Multiple pet types** (PR #64, shipped) — cosmetic skins cat / robot-vacuum / dog via
+  `PetSprite({type,mode})` + pure `petMotionGrammar(type)` (own motion grammar per skin) +
+  `petType` toggle. COSMETIC ONLY: `derivePetState`/`resolvePetMode` take no `type` argument, so the
+  hide-on-blocker honesty guarantee holds identically for every skin (red-team-confirmed).
+- Tests: `tests/petState.test.js` +6 (`resolvePetMode` precedence/honesty, `petReadabilityScale`).
+  DEV live-verified: alert fires on new-blocker edge + auto-clears (no stuck state); petScale wiring
+  (0.25→1.6, 0.64→1.25). Honesty precedence is unit-proven (live env can't hold a blocker — the hook
+  poll overwrites injected status).

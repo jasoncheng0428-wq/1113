@@ -1,0 +1,348 @@
+import { describe, it, expect } from 'vitest'
+import { normalizePost, VALID_ROLES, VALID_STATUSES, VALID_MOODS, MAX_MOOD_DURATION } from '../src/utils/normalizePost.js'
+
+describe('normalizePost', () => {
+  describe('shorthand format', () => {
+    it('converts dev: "working" to full format', () => {
+      const result = normalizePost({ dev: 'working' })
+      expect(result.type).toBe('office-status')
+      expect(result.agents).toHaveLength(1)
+      // toEqual pins the complete agent shape — AVO-146: shorthand branch now also carries
+      // reasonCode/activeFile (previously silently dropped); null is the correct default.
+      expect(result.agents[0]).toEqual({ role: 'dev', status: 'working', task: null, label: null, hint: null, reasonCode: null, activeFile: null, skill: null })
+      expect(result.activeCount).toBe(1)
+    })
+
+    it('treats non-status values as tasks with status "working"', () => {
+      const result = normalizePost({ dev: 'writing tests' })
+      // AVO-146: shorthand branch now also carries reasonCode/activeFile (additive change).
+      expect(result.agents[0]).toEqual({ role: 'dev', status: 'working', task: 'writing tests', label: null, hint: null, reasonCode: null, activeFile: null, skill: null })
+    })
+
+    it('handles multiple agents', () => {
+      const result = normalizePost({ dev: 'working', qa: 'blocked', ops: 'done' })
+      expect(result.agents).toHaveLength(3)
+      expect(result.activeCount).toBe(2) // dev + qa, not ops (done)
+    })
+
+    it('treats awaiting-approval as a real transport status', () => {
+      const result = normalizePost({ qa: 'awaiting-approval' })
+      expect(result.agents[0].status).toBe('awaiting-approval')
+      expect(result.agents[0].task).toBeNull()
+      expect(result.activeCount).toBe(1)
+    })
+
+    it('does not count idle agents as active', () => {
+      const result = normalizePost({ dev: 'idle', qa: 'working' })
+      expect(result.activeCount).toBe(1) // only qa (working), not dev (idle)
+    })
+
+    it('ignores unknown roles', () => {
+      const result = normalizePost({ dev: 'working', hacker: 'evil' })
+      expect(result.agents).toHaveLength(1)
+      expect(result.agents[0].role).toBe('dev')
+    })
+
+    it('passes through workflow and source', () => {
+      const result = normalizePost({ dev: 'working', workflow: 'Sprint 1', source: 'curl' })
+      expect(result.workflow).toBe('Sprint 1')
+      expect(result.source).toBe('curl')
+    })
+
+    it('defaults source to "api"', () => {
+      const result = normalizePost({ dev: 'working' })
+      expect(result.source).toBe('api')
+    })
+
+    it('passes label and hint to all agents', () => {
+      const result = normalizePost({ dev: 'working', qa: 'working', label: 'editing App.jsx', hint: 'error' })
+      for (const a of result.agents) {
+        expect(a.label).toBe('editing App.jsx')
+        expect(a.hint).toBe('error')
+      }
+    })
+
+    it('truncates hint at 200 characters', () => {
+      const longHint = 'x'.repeat(300)
+      const result = normalizePost({ dev: 'working', hint: longHint })
+      expect(result.agents[0].hint).toHaveLength(200)
+    })
+
+    it('rejects non-string hint values', () => {
+      expect(normalizePost({ dev: 'working', hint: 42 }).agents[0].hint).toBeNull()
+      expect(normalizePost({ dev: 'working', hint: { xss: true } }).agents[0].hint).toBeNull()
+      expect(normalizePost({ dev: 'working', hint: ['a'] }).agents[0].hint).toBeNull()
+    })
+  })
+
+  describe('full format (type: office-status)', () => {
+    it('full-format agent shape is exactly {role,status,task,label,hint,reasonCode,activeFile,skill}', () => {
+      const result = normalizePost({ type: 'office-status', agents: [{ role: 'dev', status: 'working' }] })
+      expect(result.agents[0]).toEqual({ role: 'dev', status: 'working', task: null, label: null, hint: null, reasonCode: null, activeFile: null, skill: null })
+    })
+
+    it('passes through valid agents', () => {
+      const body = {
+        type: 'office-status',
+        agents: [{ role: 'dev', status: 'working' }, { role: 'qa', status: 'done' }],
+      }
+      const result = normalizePost(body)
+      expect(result.agents).toHaveLength(2)
+    })
+
+    it('filters out invalid roles', () => {
+      const body = {
+        type: 'office-status',
+        agents: [{ role: 'dev', status: 'working' }, { role: 'hacker', status: 'working' }],
+      }
+      const result = normalizePost(body)
+      expect(result.agents).toHaveLength(1)
+      expect(result.agents[0].role).toBe('dev')
+    })
+
+    // #52 — an agent with a VALID role but an invalid/missing status is kept and degraded to
+    // 'idle' (not dropped), so it still renders in the roster/office. Identity (role) is required;
+    // status degrades safely. (Old behavior dropped the whole agent, blanking it from the UI.)
+    it('coerces invalid status to idle instead of dropping the agent (#52)', () => {
+      const body = {
+        type: 'office-status',
+        agents: [{ role: 'dev', status: 'working' }, { role: 'qa', status: 'sleeping' }],
+      }
+      const result = normalizePost(body)
+      expect(result.agents).toHaveLength(2)
+      expect(result.agents[1]).toEqual({ role: 'qa', status: 'idle', task: null, label: null, hint: null, reasonCode: null, activeFile: null, skill: null })
+    })
+
+    it('coerces null / undefined / missing status to idle (#52)', () => {
+      const body = {
+        type: 'office-status',
+        agents: [
+          { role: 'dev', status: null },
+          { role: 'qa', status: undefined },
+          { role: 'ops' }, // status field absent entirely
+        ],
+      }
+      const result = normalizePost(body)
+      expect(result.agents).toHaveLength(3)
+      expect(result.agents.map(a => a.status)).toEqual(['idle', 'idle', 'idle'])
+    })
+
+    it('coerces non-string status (number/object/array) to idle (#52)', () => {
+      const body = {
+        type: 'office-status',
+        agents: [
+          { role: 'dev', status: 42 },
+          { role: 'qa', status: { evil: true } },
+          { role: 'ops', status: ['working'] },
+        ],
+      }
+      const result = normalizePost(body)
+      expect(result.agents.map(a => a.status)).toEqual(['idle', 'idle', 'idle'])
+    })
+
+    it('an idle-coerced agent is not counted as active (#52)', () => {
+      const body = {
+        type: 'office-status',
+        agents: [{ role: 'dev', status: 'working' }, { role: 'qa', status: null }],
+      }
+      const result = normalizePost(body)
+      expect(result.activeCount).toBe(1) // only dev; the null→idle qa is not active
+    })
+
+    it('still drops agents with an invalid/unknown role — role has no safe fallback (#52)', () => {
+      const body = {
+        type: 'office-status',
+        agents: [{ role: 'hacker', status: null }, { role: 'dev', status: 'working' }],
+      }
+      const result = normalizePost(body)
+      expect(result.agents).toHaveLength(1)
+      expect(result.agents[0].role).toBe('dev')
+    })
+
+    it('normalizes hint to null if missing', () => {
+      const body = {
+        type: 'office-status',
+        agents: [{ role: 'dev', status: 'working' }],
+      }
+      const result = normalizePost(body)
+      expect(result.agents[0].hint).toBeNull()
+    })
+
+    it('truncates hint at 200 characters in full format', () => {
+      const body = {
+        type: 'office-status',
+        agents: [{ role: 'dev', status: 'working', hint: 'y'.repeat(300) }],
+      }
+      const result = normalizePost(body)
+      expect(result.agents[0].hint).toHaveLength(200)
+    })
+
+    it('rejects non-string hint in full format', () => {
+      const body = {
+        type: 'office-status',
+        agents: [{ role: 'dev', status: 'working', hint: 999 }],
+      }
+      const result = normalizePost(body)
+      expect(result.agents[0].hint).toBeNull()
+    })
+  })
+
+  describe('mood validation', () => {
+    it('accepts valid moods', () => {
+      for (const mood of VALID_MOODS) {
+        const result = normalizePost({ dev: 'working', mood })
+        expect(result.mood).toBe(mood)
+      }
+    })
+
+    it('rejects invalid moods', () => {
+      const result = normalizePost({ dev: 'working', mood: 'hacked' })
+      expect(result.mood).toBeNull()
+    })
+
+    it('rejects invalid moods in full format', () => {
+      const result = normalizePost({ type: 'office-status', agents: [], mood: '<script>' })
+      expect(result.mood).toBeNull()
+    })
+
+    it('nulls moodDuration when mood is invalid — orphan duration must not be shipped', () => {
+      const r1 = normalizePost({ dev: 'working', mood: 'hacked', moodDuration: 5000 })
+      expect(r1.mood).toBeNull()
+      expect(r1.moodDuration).toBeNull()
+      const r2 = normalizePost({ type: 'office-status', agents: [], mood: '<bad>', moodDuration: 30000 })
+      expect(r2.moodDuration).toBeNull()
+    })
+  })
+
+  describe('moodDuration capping', () => {
+    it('caps duration at MAX_MOOD_DURATION', () => {
+      const result = normalizePost({
+        type: 'office-status', agents: [],
+        mood: 'rushing', moodDuration: 999_999_999,
+      })
+      expect(result.moodDuration).toBe(MAX_MOOD_DURATION)
+    })
+
+    it('defaults to 60000 for non-numeric duration', () => {
+      const result = normalizePost({
+        type: 'office-status', agents: [],
+        mood: 'rushing', moodDuration: 'forever',
+      })
+      expect(result.moodDuration).toBe(60000)
+    })
+
+    it('passes through valid duration', () => {
+      const result = normalizePost({
+        type: 'office-status', agents: [],
+        mood: 'rushing', moodDuration: 30000,
+      })
+      expect(result.moodDuration).toBe(30000)
+    })
+
+    it('clamps zero to floor (1000)', () => {
+      const result = normalizePost({
+        type: 'office-status', agents: [],
+        mood: 'rushing', moodDuration: 0,
+      })
+      expect(result.moodDuration).toBe(1000)
+    })
+
+    it('clamps negative to floor (1000)', () => {
+      const result = normalizePost({
+        type: 'office-status', agents: [],
+        mood: 'rushing', moodDuration: -5,
+      })
+      expect(result.moodDuration).toBe(1000)
+    })
+
+    it('clamps sub-floor value to 1000', () => {
+      const result = normalizePost({
+        type: 'office-status', agents: [],
+        mood: 'rushing', moodDuration: 500,
+      })
+      expect(result.moodDuration).toBe(1000)
+    })
+
+    it('clamps zero in shorthand format to floor (1000)', () => {
+      const result = normalizePost({ dev: 'working', mood: 'rushing', moodDuration: 0 })
+      expect(result.moodDuration).toBe(1000)
+    })
+
+    it('returns null when moodDuration is null', () => {
+      const result = normalizePost({
+        type: 'office-status', agents: [],
+        mood: 'rushing', moodDuration: null,
+      })
+      expect(result.moodDuration).toBeNull()
+    })
+  })
+
+  describe('edge cases', () => {
+    it('handles empty body', () => {
+      const result = normalizePost({})
+      expect(result.agents).toHaveLength(0)
+      expect(result.activeCount).toBe(0)
+    })
+
+    it('handles null values for roles', () => {
+      const result = normalizePost({ dev: null, qa: 'working' })
+      expect(result.agents).toHaveLength(1)
+      expect(result.agents[0].role).toBe('qa')
+    })
+
+    it('ghost agent: boolean values must not create agents', () => {
+      expect(normalizePost({ dev: false, qa: 'working' }).agents).toHaveLength(1)
+      expect(normalizePost({ dev: true, qa: 'working' }).agents).toHaveLength(1)
+    })
+
+    it('ghost agent: numeric values must not create agents', () => {
+      expect(normalizePost({ dev: 0, qa: 'working' }).agents).toHaveLength(1)
+      expect(normalizePost({ dev: 42, qa: 'working' }).agents).toHaveLength(1)
+    })
+
+    it('duplicate roles in full format: first occurrence wins', () => {
+      const result = normalizePost({
+        type: 'office-status',
+        agents: [{ role: 'dev', status: 'working' }, { role: 'dev', status: 'done' }],
+      })
+      expect(result.agents).toHaveLength(1)
+      expect(result.agents[0].status).toBe('working')
+    })
+  })
+})
+
+describe('constants', () => {
+  it('VALID_ROLES has 8 entries', () => {
+    expect(VALID_ROLES).toHaveLength(8)
+  })
+
+  it('VALID_STATUSES includes plan mode and human-approval waits', () => {
+    expect(VALID_STATUSES).toContain('planning')
+    expect(VALID_STATUSES).toContain('awaiting-approval')
+  })
+
+  it('VALID_MOODS has 7 entries', () => {
+    expect(VALID_MOODS).toHaveLength(7)
+  })
+
+  it('MAX_MOOD_DURATION is 1 hour', () => {
+    expect(MAX_MOOD_DURATION).toBe(3_600_000)
+  })
+})
+
+// AVO-110 — the POST /api/status ingest must carry the enum-validated blocked-reason too
+// (the 4th transport whitelist the spec review caught).
+describe('normalizePost — blocked-reason (AVO-110)', () => {
+  it('carries a valid reasonCode on an office-status agent', () => {
+    const r = normalizePost({ type: 'office-status', agents: [{ role: 'dev', status: 'blocked', reasonCode: 'test-run-failed' }] })
+    expect(r.agents[0].reasonCode).toBe('test-run-failed')
+  })
+  it('rejects a non-enum reasonCode → null (trust boundary)', () => {
+    const r = normalizePost({ type: 'office-status', agents: [{ role: 'dev', status: 'blocked', reasonCode: 'evil' }] })
+    expect(r.agents[0].reasonCode).toBeNull()
+  })
+  it('absent reasonCode → null', () => {
+    const r = normalizePost({ type: 'office-status', agents: [{ role: 'dev', status: 'blocked' }] })
+    expect(r.agents[0].reasonCode).toBeNull()
+  })
+})

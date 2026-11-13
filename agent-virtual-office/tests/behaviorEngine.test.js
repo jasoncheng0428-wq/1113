@@ -1,0 +1,264 @@
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+// Deflake (2026-06-11): these suites exercise Math.random-dependent code (corridor/anti-stack
+// jitter in calculatePath; weighted behavior picks). Unseeded runs failed ~1/500 full-suite
+// runs on marginal geometry/edge picks. Seed per established mulberry32 idiom.
+function __mulberry32(seed) {
+  let a = seed >>> 0
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+const __realRandom = Math.random
+beforeAll(() => { Math.random = __mulberry32(0x0ff1ce) })
+afterAll(() => { Math.random = __realRandom })
+import { getNextBehavior, getHourModifiers, MAX_CONCURRENT_OUT_TRIPS } from '../src/systems/behaviorEngine.js'
+import { needsLocationChange } from '../src/systems/movementSystem.js'
+
+// Every VALID_ROLE plus a couple of composite worktree ids — getNextBehavior must
+// produce a well-formed result for all of them, including the fallback path.
+const ROLES = ['pm', 'arch', 'dev', 'qa', 'ops', 'res', 'gate', 'designer']
+const COMPOSITES = ['feat-x~dev', 'long-slug~qa', 'a~b~ops']
+const STATUSES = ['idle', 'working', 'done', 'blocked']
+
+describe('behaviorEngine — getNextBehavior contract', () => {
+  it('always returns a well-formed behavior object — finite positive duration', () => {
+    // Exhaustive sweep: every role × status × representative hours × moods.
+    const hours = [0, 9, 12, 14, 20, 23]
+    const moods = ['normal', 'rushing', 'frustrated', 'stuck', 'smooth', 'intense', 'idle']
+    for (const role of [...ROLES, ...COMPOSITES]) {
+      for (const status of STATUSES) {
+        for (const hour of hours) {
+          for (const mood of moods) {
+            // Repeat — weightedRandom is stochastic, exercise many category picks.
+            for (let i = 0; i < 12; i++) {
+              const next = getNextBehavior(role, status, hour, mood)
+              expect(typeof next.behaviorId, `${role}/${status}/${hour}/${mood} behaviorId`).toBe('string')
+              expect(next.behaviorId.length).toBeGreaterThan(0)
+              expect(typeof next.expression).toBe('string')
+              expect(next.expression.length).toBeGreaterThan(0)
+              // A NaN/Infinity/<=0 duration would spin doSchedule's setTimeout in a CPU loop.
+              expect(Number.isFinite(next.duration), `${role}/${status} duration finite`).toBe(true)
+              expect(next.duration).toBeGreaterThan(0)
+            }
+          }
+        }
+      }
+    }
+  }, 10_000)
+
+  it('never returns an undefined behaviorId from the fallback path', () => {
+    // gate/designer only match a few work behaviors — the work category for them is
+    // a thin filtered pool. Hammer it to ensure pickBehavior never yields a bad shape.
+    for (let i = 0; i < 500; i++) {
+      const next = getNextBehavior('gate', 'working', 9, 'intense')
+      expect(next.behaviorId).toBeTypeOf('string')
+      expect(Number.isFinite(next.duration)).toBe(true)
+    }
+  })
+
+  it('blocked status can route through the frustrated category with a valid shape', () => {
+    let sawFrustrated = false
+    for (let i = 0; i < 400; i++) {
+      const next = getNextBehavior('dev', 'blocked', 9, 'normal')
+      expect(Number.isFinite(next.duration)).toBe(true)
+      expect(next.behaviorId).toBeTypeOf('string')
+      if (next.category === 'frustrated') sawFrustrated = true
+    }
+    expect(sawFrustrated).toBe(true)
+  })
+
+  it('getHourModifiers returns null outside special windows, objects inside', () => {
+    expect(getHourModifiers(9)).toBe(null)
+    expect(getHourModifiers(12)).toMatchObject({ away: expect.any(Number) })
+    expect(getHourModifiers(14)).toMatchObject({ work: expect.any(Number) })
+    expect(getHourModifiers(21)).toMatchObject({ work: expect.any(Number) })
+  })
+})
+
+describe('behaviorEngine — getHourModifiers exact values', () => {
+  it('hour 12: lunch break weights (strong away)', () => {
+    expect(getHourModifiers(12)).toEqual({ away: 40, daily: 30, work: 20, social: 10 })
+  })
+
+  it('hour 14: post-lunch weights (mixed)', () => {
+    expect(getHourModifiers(14)).toEqual({ work: 30, daily: 35, social: 15, away: 20 })
+  })
+
+  it('hour 20: overtime weights (heavy work)', () => {
+    expect(getHourModifiers(20)).toEqual({ work: 70, daily: 15, social: 5, away: 10 })
+  })
+
+  it('hours 13 and 15-19 fall outside all special windows → null', () => {
+    for (const h of [13, 15, 16, 17, 18, 19]) {
+      expect(getHourModifiers(h), `hour ${h}`).toBeNull()
+    }
+  })
+
+  it('hours 0-11 (excluding 12) return null', () => {
+    for (const h of [0, 1, 5, 7, 9, 10, 11]) {
+      expect(getHourModifiers(h), `hour ${h}`).toBeNull()
+    }
+  })
+
+  it('hour window boundaries: 11 → null, 12 → lunch, 13 → null, 14 → drowsy, 15 → null, 20 → overtime', () => {
+    expect(getHourModifiers(11)).toBeNull()
+    expect(getHourModifiers(12)).not.toBeNull()
+    expect(getHourModifiers(13)).toBeNull()
+    expect(getHourModifiers(14)).not.toBeNull()
+    expect(getHourModifiers(15)).toBeNull()
+    expect(getHourModifiers(20)).not.toBeNull()
+  })
+})
+
+describe('behaviorEngine — role-specific behavior filtering', () => {
+  it('pm-only "gantt-chart" appears for pm in working/intense (in 500 runs)', () => {
+    let sawGantt = false
+    for (let i = 0; i < 500; i++) {
+      const next = getNextBehavior('pm', 'working', 9, 'intense')
+      if (next.behaviorId === 'gantt-chart') { sawGantt = true; break }
+    }
+    expect(sawGantt).toBe(true)
+  })
+
+  it('pm-only "gantt-chart" never appears for dev (500 runs)', () => {
+    for (let i = 0; i < 500; i++) {
+      expect(getNextBehavior('dev', 'working', 9, 'intense').behaviorId).not.toBe('gantt-chart')
+    }
+  })
+
+  it('qa-only "magnifier" never appears for ops (500 runs)', () => {
+    for (let i = 0; i < 500; i++) {
+      expect(getNextBehavior('ops', 'working', 9, 'intense').behaviorId).not.toBe('magnifier')
+    }
+  })
+
+  it('ops-only "deploy-button" never appears for arch (500 runs)', () => {
+    for (let i = 0; i < 500; i++) {
+      expect(getNextBehavior('arch', 'working', 9, 'normal').behaviorId).not.toBe('deploy-button')
+    }
+  })
+
+  it('composite agentId "feat-x~dev" extracts dev role: no role-restricted behaviors from other roles', () => {
+    const otherRoleOnly = ['gantt-chart', 'magnifier', 'deploy-button', 'shield-verify']
+    for (let i = 0; i < 300; i++) {
+      const next = getNextBehavior('feat-x~dev', 'working', 9, 'intense')
+      expect(otherRoleOnly, `feat-x~dev got restricted behavior: ${next.behaviorId}`).not.toContain(next.behaviorId)
+    }
+  })
+})
+
+// AVO-133: a blocked agent must visibly read as "stuck" — the behavior engine biases it
+// toward the frustration cluster (scratch-head / sigh / desk-slam) so trouble is legible
+// from posture in peripheral vision before anyone clicks to inspect.
+describe('getNextBehavior — blocked biases toward frustration (AVO-133)', () => {
+  const FRUSTRATED = ['scratch-head', 'sigh', 'desk-slam']
+
+  it('picks the frustrated category far above a uniform baseline when blocked', () => {
+    let frustrated = 0
+    const N = 400
+    for (let i = 0; i < N; i++) {
+      // hour 10 = no hour modifier, mood normal = no mood blend → clean status weights
+      if (getNextBehavior('dev', 'blocked', 10, 'normal').category === 'frustrated') frustrated++
+    }
+    // blocked weights frustrated at 60/100; a uniform pick over 5 categories would be ~20%
+    expect(frustrated / N).toBeGreaterThan(0.4)
+  })
+
+  it('every frustrated behavior a blocked agent picks is the scratch-head/sigh/desk-slam cluster', () => {
+    const seen = new Set()
+    for (let i = 0; i < 400; i++) {
+      const b = getNextBehavior('qa', 'blocked', 10, 'normal')
+      if (b.category === 'frustrated') seen.add(b.behaviorId)
+    }
+    expect(seen.size).toBeGreaterThan(0)
+    for (const id of seen) expect(FRUSTRATED).toContain(id)
+  })
+
+  it('an idle agent does NOT read as frustrated (contrast — no false "stuck" signal)', () => {
+    let frustrated = 0
+    for (let i = 0; i < 400; i++) {
+      if (getNextBehavior('dev', 'idle', 10, 'normal').category === 'frustrated') frustrated++
+    }
+    expect(frustrated / 400).toBeLessThan(0.2)
+  })
+})
+
+// Calm-rhythm tuning (owner 2026-06-10: "一直走動很躁動" + "都不去其他房間"). Live audit
+// measured ≥1 walker on screen 83% of samples; root cause was solo `meeting` in the work
+// pool (~20% of ALL cycles became a lone meeting-room march) drowning out break-room trips.
+describe('getNextBehavior — calm rhythm (no solo meeting, bounded walk share)', () => {
+  it('the solo engine NEVER emits `meeting` — that room belongs to officeLife group events', () => {
+    for (const role of [...ROLES, ...COMPOSITES]) {
+      for (const status of STATUSES) {
+        for (let i = 0; i < 60; i++) {
+          expect(getNextBehavior(role, status, 10, 'normal').behaviorId).not.toBe('meeting')
+        }
+      }
+    }
+  })
+
+  it('a WORKING agent walks in at most ~1/5 of cycles (desk time ≈ its real status)', () => {
+    let walks = 0
+    const N = 4000
+    for (let i = 0; i < N; i++) {
+      // hour 10 (no hour modifier), mood normal (no blend) → clean status weights
+      if (needsLocationChange(getNextBehavior('dev', 'working', 10, 'normal').behaviorId)) walks++
+    }
+    // working weights: daily 8 + social 5 + away 5 = 18% walk-capable; pin with slack.
+    // (Pre-fix this measured 38.5% — meeting alone contributed ~20.5%.)
+    expect(walks / N).toBeLessThan(0.22)
+  })
+
+  it('room destinations are still reachable — daily/away behaviors survive the tuning', () => {
+    const seen = new Set()
+    for (let i = 0; i < 3000; i++) {
+      const b = getNextBehavior('dev', 'idle', 10, 'normal')
+      if (needsLocationChange(b.behaviorId)) seen.add(b.behaviorId)
+    }
+    // The break-room cluster must remain in play (lounge/coffee zone visits stay possible).
+    for (const id of ['drink-coffee', 'drink-water', 'goto-coffee-machine']) {
+      expect(seen.has(id), `${id} should still occur for an idle agent`).toBe(true)
+    }
+  })
+})
+
+describe('AVO-165 — concurrent out-trip soft-cap', () => {
+  const OUT = new Set(['daily', 'social', 'away'])
+
+  it('at/above the cap, an idle agent never starts an out-trip (stays at desk)', () => {
+    let outTrips = 0
+    for (let i = 0; i < 400; i++) {
+      const c = getNextBehavior('dev', 'idle', 10, 'normal', 0, MAX_CONCURRENT_OUT_TRIPS).category
+      if (OUT.has(c)) outTrips++
+    }
+    expect(outTrips).toBe(0)
+  })
+
+  it('below the cap, out-trips still happen (the cap does not deaden the office)', () => {
+    let outTrips = 0
+    for (let i = 0; i < 400; i++) {
+      const c = getNextBehavior('dev', 'idle', 10, 'normal', 0, 0).category
+      if (OUT.has(c)) outTrips++
+    }
+    expect(outTrips).toBeGreaterThan(0)
+  })
+
+  it('a capped out-trip resolves to a real work behavior (consistent category + behaviorId)', () => {
+    const b = getNextBehavior('dev', 'idle', 10, 'normal', 0, MAX_CONCURRENT_OUT_TRIPS + 5)
+    expect(b.category).toBe('work')
+    expect(typeof b.behaviorId).toBe('string')
+    expect(b.behaviorId.length).toBeGreaterThan(0)
+  })
+
+  it('default outTripCount (0) preserves prior behavior — out-trips unaffected', () => {
+    let outTrips = 0
+    for (let i = 0; i < 400; i++) {
+      const c = getNextBehavior('dev', 'idle', 10, 'normal').category  // no outTripCount arg
+      if (OUT.has(c)) outTrips++
+    }
+    expect(outTrips).toBeGreaterThan(0)
+  })
+})

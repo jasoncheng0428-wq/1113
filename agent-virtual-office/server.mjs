@@ -1,0 +1,854 @@
+#!/usr/bin/env node
+/**
+ * server.mjs — Standalone production server for agent-virtual-office
+ *
+ * Serves dist/ as static files AND provides the same API endpoints as the
+ * Vite dev server (/api/status, /api/lang, /api/event). No new dependencies —
+ * uses only Node.js built-in modules.
+ *
+ * Usage:
+ *   node server.mjs [--port=5174] [--host] [--no-open]
+ *   npx agent-virtual-office serve [--port=5174] [--host]
+ *   npm run serve
+ */
+
+import http from 'node:http'
+import fs from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+import net from 'node:net'
+import { createHash, timingSafeEqual } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import { execSync } from 'node:child_process'
+import { scanAndMerge, getSessionStats, resolveProjectRoot } from './src/server/scanSessions.mjs'
+import { startAntigravityWatcher } from './src/server/antigravityWatcher.mjs'
+// AVO-146: replaced inline normalizePost copy with the canonical src module.
+// This also fixes the #52 divergence: the old inline copy dropped agents with
+// invalid status; the canonical src module coerces them to 'idle' instead.
+// Uses the .mjs extension so Node.js can import it directly at runtime
+// (package "type":"commonjs" prevents importing .js ESM files without transpilation).
+import { normalizePost, nextSeq, VALID_ROLES, VALID_STATUSES } from './src/utils/normalizePost.mjs'
+// fix/dev-allowed-hosts: the env-parsing step of the Host allowlist below is now shared with
+// vite.config.mjs (the dev server) so OFFICE_ALLOWED_HOSTS means the same thing in both
+// transports — see src/utils/hostAllowlist.mjs for what is and isn't shared.
+import { hostnameFromHeader, parseAllowedHostsEnv } from './src/utils/hostAllowlist.mjs'
+
+// Count working/blocked agents — used by the /api/event webhook handler.
+function countActive(agents) {
+  let n = 0
+  for (const a of agents) if (a.status === 'working' || a.status === 'blocked' || a.status === 'planning' || a.status === 'awaiting-approval') n++
+  return n
+}
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const dist = path.join(__dirname, 'dist')
+
+// ─── Args ───────────────────────────────────────────────────────────────────
+const rawArgs = process.argv.slice(2)
+function argVal(prefix) {
+  const hit = rawArgs.find(a => a.startsWith(prefix))
+  return hit ? hit.slice(prefix.length) : undefined
+}
+
+const rawPort = argVal('--port=') || '5174'
+const _parsedPort = parseInt(rawPort, 10)
+if (!/^\d+$/.test(rawPort) || isNaN(_parsedPort) || _parsedPort < 1 || _parsedPort > 65535) {
+  console.error(`\n  Invalid port "${rawPort}". Must be 1–65535.\n`)
+  process.exit(1)
+}
+const port = _parsedPort
+const bindHost = rawArgs.includes('--host') ? '0.0.0.0' : '127.0.0.1'
+const lang = argVal('--lang=')
+if (lang && !/^[a-zA-Z-]{2,10}$/.test(lang)) {
+  console.error(`\n  Invalid --lang "${lang}". Use "en" or "zh-TW".\n`)
+  process.exit(1)
+}
+const openBrowser = !rawArgs.includes('--no-open')
+
+if (!fs.existsSync(path.join(dist, 'index.html'))) {
+  console.error('\n  dist/index.html not found. Build first:\n    npm run build\n    npx agent-virtual-office serve\n')
+  process.exit(1)
+}
+
+// ─── Shared paths ────────────────────────────────────────────────────────────
+// OFFICE_STATUS_DIR overrides the directory the office reads/writes status in, matching
+// `vite.config.mjs` (the dev server) so the two transports resolve the same path from the
+// same input. Without it the only way to relocate the status directory here was to spoof
+// HOME/USERPROFILE for the whole process, which is what the E2E tests had to do and what a
+// deployment on a read-only rootfs or a service account with an unusual home was left with.
+//
+// This is NOT a status-fabrication surface: it only re-points the file the existing
+// /api/status writer already owns. The known hazard is the operator-forgetfulness one
+// recorded when the dev-server flag shipped -- a stale/empty office being read as if it
+// were live -- so an override is announced in the startup banner below rather than being
+// silent. `path.dirname(STATUS_PATH)` is also what scanAndMerge/getSessionStats scan, so
+// session discovery follows the override with no second knob.
+const STATUS_DIR = process.env.OFFICE_STATUS_DIR || path.join(os.homedir(), '.claude')
+const STATUS_PATH = path.join(STATUS_DIR, 'office-status.json')
+
+// The project directory session files are matched against. This process is spawned with its
+// cwd set to the package root by bin/cli.js (and therefore by npx), so process.cwd() cannot
+// be used here — see resolveProjectRoot() in src/server/scanSessions.mjs.
+const PROJECT_ROOT = resolveProjectRoot()
+
+// Fail fast if the state directory is not writable (catches Docker bind-mount misconfiguration).
+try {
+  fs.mkdirSync(path.dirname(STATUS_PATH), { recursive: true })
+  fs.accessSync(path.dirname(STATUS_PATH), fs.constants.W_OK)
+} catch {
+  console.error(`\n  FATAL: ${path.dirname(STATUS_PATH)} is not writable.`)
+  console.error('  Docker: run "mkdir -p ~/.claude && sudo chown 1000 ~/.claude" on the host first.\n')
+  process.exit(1)
+}
+
+// Passive observation is independent of HTTP requests and never registers source hooks.
+const antigravityWatcher = startAntigravityWatcher({ projectRoot: PROJECT_ROOT, statusDir: STATUS_DIR })
+
+// Atomic write: write to a temp file then rename so concurrent readers
+// never see a partial file. Falls back to direct write on Windows EBUSY.
+// Returns true on success, false if both paths fail.
+// Temp file is always cleaned up (was previously leaked on EBUSY rename).
+function atomicWrite(filePath, content) {
+  const tmp = filePath + '.tmp.' + process.pid + '.' + (Math.random().toString(36).slice(2) + '000000').slice(0, 6)
+  try {
+    fs.writeFileSync(tmp, content)
+    fs.renameSync(tmp, filePath)
+    return true
+  } catch {
+    let ok = false
+    try { fs.writeFileSync(filePath, content); ok = true } catch {}
+    try { fs.unlinkSync(tmp) } catch {}
+    return ok
+  }
+}
+
+// Monotonic _seq: shared SINGLE counter imported from normalizePost.mjs — /api/status
+// (inside normalizePost) and /api/event (nextSeq below) write the same status file and
+// must ride one clock, or a burst on one endpoint can stale-drop the other's write.
+const isWin = process.platform === 'win32'
+function pathsEqual(a, b) { return isWin ? a.toLowerCase() === b.toLowerCase() : a === b }
+
+// F1 (audit 2026-09-26): `new URL(req.url, base)` throws TypeError('Invalid URL') on a
+// malformed request-target (e.g. an absolute-form target with an invalid authority, or a
+// stray '['). That throw happens synchronously inside the http.createServer request-listener
+// callback — req/res 'error' listeners do NOT catch it — so an uncaught throw here crashes
+// the entire process on a single crafted request. Every call site that needs to parse
+// req.url MUST go through this helper instead of calling `new URL()` directly.
+function safeParseUrl(reqUrl) {
+  try { return new URL(reqUrl, 'http://x') } catch { return null }
+}
+
+// ─── SSE clients ──────────────────────────────────────────────────────────────
+const sseClients = new Set()
+
+// Producer replay fences are persisted locally, outside the browser-facing contract.
+function publicStatusJson(value) {
+  return JSON.stringify(value, (key, field) =>
+    ['_geminiOrder', '_sourceEventKey', '_sourceTimestamp', '_sourceIdle'].includes(key) ? undefined : field)
+}
+
+// LOW-4 (review round 2, 2026-09-26): with the per-socket idle timeout now disabled on SSE
+// connections (F2 above), a client (or a `--host` LAN peer) can hold sockets open
+// indefinitely. Cap concurrent SSE clients so that can never grow unbounded; configurable
+// since the right ceiling depends on deployment (a single-operator localhost office vs. a
+// shared --host instance watched by a small team). Default is generous — this is a
+// resource-exhaustion backstop, not a normal-use limit.
+const MAX_SSE_CLIENTS = (() => {
+  const raw = parseInt(process.env.OFFICE_MAX_SSE_CLIENTS, 10)
+  return Number.isFinite(raw) && raw > 0 ? raw : 500
+})()
+
+function broadcastSSE(merged) {
+  if (sseClients.size === 0) return
+  const payload = `event: status\ndata: ${publicStatusJson(merged)}\n\n`
+  for (const client of [...sseClients]) {
+    try { client.write(payload) } catch { sseClients.delete(client) }
+  }
+}
+
+// M1: capture handle so gracefulShutdown can clear it; unref so it doesn't block exit alone
+//
+// F2 (audit 2026-09-26): kept well under both the 30s server.setTimeout below AND the 30s
+// proxy_read_timeout in docs/deployment/nginx.conf — a heartbeat byte resets an intermediary
+// proxy's own idle-read timer, so 15s keeps a fronting reverse proxy from dropping the stream
+// even though the direct-connection case is now handled by req.socket.setTimeout(0) on the
+// SSE route itself (see the /api/status/stream handler below).
+const _sseHeartbeat = setInterval(() => {
+  if (sseClients.size === 0) return
+  for (const client of [...sseClients]) {
+    try { client.write(':heartbeat\n\n') } catch { sseClients.delete(client) }
+  }
+}, 15_000)
+_sseHeartbeat.unref()
+
+// ─── CORS + auth ─────────────────────────────────────────────────────────────
+const LOOPBACK_RE = /^https?:\/\/(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i
+
+function getServerIPs() {
+  const ips = new Set(['localhost', '127.0.0.1', '[::1]'])
+  try {
+    for (const iface of Object.values(os.networkInterfaces())) {
+      for (const addr of iface) {
+        if (!addr.internal) ips.add(addr.family === 'IPv6' ? `[${addr.address}]` : addr.address)
+      }
+    }
+  } catch {}
+  return ips
+}
+const SERVER_IPS = getServerIPs()
+
+// F3 (audit 2026-09-26): DNS-rebinding guard. Without a Host-header check, a malicious page
+// can rebind an attacker-controlled hostname to 127.0.0.1 and issue a same-origin GET against
+// this server from the victim's browser — bypassing our Origin-based CORS entirely, since
+// CORS never restricts simple GETs, only whether the response is *readable* cross-origin by
+// script, and a top-level/rebound navigation IS same-origin from the browser's point of view.
+// Modeled on (NOT identical to) Vite's own `server.allowedHosts` semantics — dev is already
+// covered by Vite's internal hostValidationMiddleware; this closes the same class of gap in
+// the production server, but the two allowlists differ (see review round 2, 2026-09-26):
+//   - AVO supports a leading-dot suffix entry (`.example.com` matches `example.com` AND any
+//     `*.example.com` subdomain) — verified identical to Vite's own wildcard rule
+//     (`isHostAllowedInternal` in `node_modules/vite/dist/node/chunks/node.js`), which is
+//     exactly why `vite.config.mjs` can map `OFFICE_ALLOWED_HOSTS` straight into Vite's
+//     `server.allowedHosts` via the shared parser below with no translation step.
+//   - AVO strips a trailing `:port` from env entries (`mypc.local:5174` behaves the same as
+//     `mypc.local`), since the port a request arrives on is deployment-specific and shouldn't
+//     have to be duplicated into the allowlist.
+//   - A REQUEST WITH NO HOST HEADER, OR AN EMPTY `Host:` HEADER, IS ALLOWED THROUGH (see
+//     the comment on isAllowedHost below) — this matches Vite's behavior, but for a
+//     different, explicit reason specific to this server.
+//   - An UNBRACKETED IPv6 literal in Host (e.g. `Host: ::1`, no brackets) is REJECTED, not
+//     allowed. This is deliberate, not a bug: RFC 3986 §3.2.2 / RFC 7230 §5.4 require IPv6
+//     literals in a Host header to be bracket-delimited specifically so the address's own
+//     colons can't be confused with a `:port` separator — a compliant HTTP client never
+//     sends one unbracketed. Parsing an unbracketed form "leniently" would mean guessing
+//     where the address ends and the port begins, which is exactly the kind of ambiguity a
+//     Host-validation guard exists to refuse, not paper over.
+//   - A request whose Host is disallowed but carries a VALID `OFFICE_API_TOKEN` (see
+//     hasValidApiToken, defined further down) is allowed through anyway: a DNS-rebinding
+//     browser can send any Host it likes, but it has no way to know this server's secret
+//     token, so proof of the token is proof the caller isn't a rebinding browser.
+// Parsing (port/bracket stripping, leading-dot suffix survival, blank/bare-'.' filtering) now
+// lives in src/utils/hostAllowlist.mjs (parseAllowedHostsEnv), shared with vite.config.mjs.
+const ALLOWED_HOSTS_ENV = parseAllowedHostsEnv(process.env.OFFICE_ALLOWED_HOSTS)
+
+function isAllowedHost(hostHeader) {
+  const host = hostnameFromHeader(hostHeader)
+  // A request with NO Host header, or an EMPTY `Host:` header, cannot be the product of a
+  // DNS-rebinding attack: rebinding relies on the victim's BROWSER sending an
+  // attacker-chosen Host that resolves to this server's IP, and every browser HTTP/1.1
+  // request always includes a non-empty Host header. Either case here is either a
+  // deliberately-crafted raw/HTTP-1.0-style request (already on the least-privileged path —
+  // this check runs before any handler, so it still gets routed as an ordinary GET/POST with
+  // no elevated access) or a local health-check/proxy quirk. Rejecting it would only break
+  // those benign callers while adding no protection against the actual threat model, so both
+  // are allowed through — matching Vite's own choice, arrived at independently for this
+  // reason. `hostnameFromHeader` returns `null` for both `undefined` and `''`.
+  if (host === null) return true
+  if (host === 'localhost' || host.endsWith('.localhost')) return true
+  // net.isIP() only recognizes a BRACES-FREE v4 literal or an UNBRACKETED v6 literal — but by
+  // the time we get here, hostnameFromHeader has already stripped brackets from a bracketed
+  // v6 Host, so this correctly matches `[::1]` (passed in as `::1`). An actually-unbracketed
+  // v6 Host (e.g. raw `Host: ::1`) is misparsed upstream by the port-stripping heuristic in
+  // hostnameFromHeader (it sees a colon and guesses "port") and never reaches here looking
+  // like a clean IP — see the deliberate-rejection note on ALLOWED_HOSTS_ENV above.
+  if (net.isIP(host)) return true
+  for (const ip of SERVER_IPS) {
+    if (ip.replace(/^\[|\]$/g, '').toLowerCase() === host) return true
+  }
+  for (const entry of ALLOWED_HOSTS_ENV) {
+    if (entry.startsWith('.')) {
+      if (host === entry.slice(1) || host.endsWith(entry)) return true
+    } else if (entry === host) {
+      return true
+    }
+  }
+  return false
+}
+
+// Rejected-Host logging: one line per DISTINCT rejected hostname, capped at
+// REJECTED_HOST_LOG_CAP entries for the entire lifetime of this process — NOT a
+// time-windowed rate limit (there is no reset; once 50 distinct hostnames have been seen,
+// logging for any newly-seen hostname stops until the process restarts). This bounds a
+// scanner hammering random Host values from growing the set (or the log) without bound.
+// Existing 403 behavior is unaffected either way — this only bounds *logging*, never access
+// control.
+const REJECTED_HOST_LOG_CAP = 50
+const _loggedRejectedHosts = new Set()
+function logRejectedHostOnce(hostHeader) {
+  const key = typeof hostHeader === 'string' && hostHeader ? hostHeader : '(missing)'
+  if (_loggedRejectedHosts.has(key) || _loggedRejectedHosts.size >= REJECTED_HOST_LOG_CAP) return
+  _loggedRejectedHosts.add(key)
+  console.warn(`  403: rejected request with disallowed Host "${key}". Set OFFICE_ALLOWED_HOSTS to permit it (see docs/deployment/DEPLOYMENT.md#environment-variables).`)
+}
+
+const apiToken = process.env.OFFICE_API_TOKEN?.trim() || null
+const allowedOrigins = (process.env.OFFICE_API_ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean)
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true
+  if (allowedOrigins.length > 0) return allowedOrigins.includes(origin)
+  try { if (SERVER_IPS.has(new URL(origin).hostname)) return true } catch {}
+  return LOOPBACK_RE.test(origin)
+}
+
+function getAllowedOriginHeader(origin) {
+  return origin && isAllowedOrigin(origin) ? origin : null
+}
+
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false
+  const ha = createHash('sha256').update(a).digest()
+  const hb = createHash('sha256').update(b).digest()
+  return timingSafeEqual(ha, hb)
+}
+
+// Whether THIS request carries a token that matches the configured OFFICE_API_TOKEN.
+// Distinct from isAuthorized() below: this returns false (never true) when no token is
+// configured at all, because "no secret is set" proves nothing about the caller — whereas
+// isAuthorized() treats an unset token as "endpoint doesn't require auth" and returns true.
+// Used by the F3 Host-check exemption (review round 3, MEDIUM-2): a DNS-rebinding browser
+// can issue same-origin requests with an attacker-chosen Host, but it CANNOT know this
+// server's secret token (it isn't same-origin-readable, isn't cookie-like, and the attacker
+// page never had it) — so proof of the token is proof the caller isn't a rebinding browser,
+// independent of what Host it sent. This lets a legitimate integration (e.g. the GitHub
+// Actions example in docs/INTEGRATIONS.md, POSTing by a bare hostname URL) work without also
+// needing OFFICE_ALLOWED_HOSTS, while a token-less request still gets the full Host check.
+function hasValidApiToken(req) {
+  if (!apiToken) return false
+  const h = req.headers['x-office-token']
+  const a = req.headers.authorization
+  // Evaluate both before OR-ing — avoids timing oracle from short-circuit evaluation.
+  const m1 = typeof h === 'string' && safeEqual(h, apiToken)
+  const m2 = typeof a === 'string' && safeEqual(a, `Bearer ${apiToken}`)
+  return m1 || m2
+}
+
+function isAuthorized(req) {
+  return !apiToken || hasValidApiToken(req)
+}
+
+// ─── Rate limiter (sliding window) ───────────────────────────────────────────
+// Keyed on IP only (not per-endpoint) — shared 30 POST / 10s budget across all
+// write endpoints. Per-endpoint keying would allow 90 writes/10s (3 endpoints × 30).
+// Behind a reverse proxy all requests arrive from 127.0.0.1, making this a global
+// aggregate cap; Nginx's limit_req (docs/deployment/nginx.conf) is the real
+// per-client guard in that case. Sliding window eliminates fixed-window burst flaw.
+const postCounts = new Map()
+const RATE_WINDOW = 10000, RATE_LIMIT = 30
+
+function checkRateLimit(req) {
+  if (req.method !== 'POST') return true
+  const ip = req.socket?.remoteAddress || 'unknown'
+  const now = Date.now()
+  const ts = postCounts.get(ip) || []
+  const fresh = ts.filter(t => now - t < RATE_WINDOW)
+  if (fresh.length >= RATE_LIMIT) { postCounts.set(ip, fresh); return false }
+  fresh.push(now)
+  postCounts.set(ip, fresh)
+  return true
+}
+
+// ─── CORS headers ─────────────────────────────────────────────────────────────
+function setCors(res, origin, methods = 'GET, POST, OPTIONS') {
+  const allowed = getAllowedOriginHeader(origin)
+  if (allowed) res.setHeader('Access-Control-Allow-Origin', allowed)
+  res.setHeader('Access-Control-Allow-Methods', methods)
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, If-None-Match, X-Office-Token, Authorization')
+  res.setHeader('Vary', 'Origin')
+}
+
+function handlePreflight(req, res) {
+  if (!isAllowedOrigin(req.headers.origin)) {
+    res.statusCode = 403
+    return res.end(JSON.stringify({ ok: false, error: 'Origin not allowed' }))
+  }
+  res.setHeader('Access-Control-Max-Age', '600')
+  res.statusCode = 204
+  return res.end()
+}
+
+// ─── /api/status ─────────────────────────────────────────────────────────────
+function handleStatus(req, res) {
+  res.setHeader('Content-Type', 'application/json')
+  res.setHeader('Cache-Control', 'no-cache')
+  setCors(res, req.headers.origin)
+
+  if (req.method === 'OPTIONS') return handlePreflight(req, res)
+
+  if (req.method === 'GET') {
+    try {
+      const clientEtag = req.headers['if-none-match']
+      const merged = scanAndMerge(path.dirname(STATUS_PATH), PROJECT_ROOT)
+      if (!merged) return res.end('null')
+      const data = publicStatusJson(merged)
+      const etag = '"' + createHash('md5').update(data).digest('hex').slice(0, 12) + '"'
+      if (clientEtag === etag) { res.statusCode = 304; return res.end() }
+      res.setHeader('ETag', etag)
+      return res.end(data)
+    } catch { return res.end('null') }
+  }
+
+  if (req.method === 'POST') {
+    const reqOrigin = req.headers.origin
+    if (reqOrigin && !isAllowedOrigin(reqOrigin)) { res.statusCode = 403; return res.end(JSON.stringify({ ok: false, error: 'Origin not allowed' })) }
+    if (!isAuthorized(req)) { res.statusCode = 401; return res.end(JSON.stringify({ ok: false, error: 'Unauthorized' })) }
+    if (!checkRateLimit(req)) { res.statusCode = 429; return res.end(JSON.stringify({ ok: false, error: 'Too many requests' })) }
+    req.setEncoding('utf-8')
+    let body = '', aborted = false, receivedBytes = 0
+    req.on('data', chunk => {
+      if (aborted) return
+      receivedBytes += Buffer.byteLength(chunk, 'utf8')
+      if (receivedBytes > 16384) { aborted = true; res.statusCode = 413; res.end(JSON.stringify({ ok: false, error: 'Body too large' })); req.resume(); return }
+      body += chunk
+    })
+    req.on('end', () => {
+      if (aborted) return
+      let normalized
+      try {
+        normalized = normalizePost(JSON.parse(body))
+        normalized._cwd = PROJECT_ROOT
+        if (!atomicWrite(STATUS_PATH, JSON.stringify(normalized, null, 2))) {
+          res.statusCode = 500; return res.end(JSON.stringify({ ok: false, error: 'Write failed' }))
+        }
+      } catch { res.statusCode = 400; res.end(JSON.stringify({ ok: false, error: 'Invalid JSON' })); return }
+      // Write succeeded — respond before the best-effort SSE broadcast. A scanAndMerge or
+      // broadcastSSE failure must not misreport a valid, persisted update as a 400 (which
+      // would make clients retry and double-post).
+      res.end(JSON.stringify({ ok: true, agents: normalized.agents?.length ?? 0 }))
+      // Skip the broadcast scan entirely when no SSE clients are connected —
+      // scanAndMerge re-reads and re-parses every status file in ~/.claude/.
+      if (sseClients.size > 0) {
+        try {
+          const ssePayload = scanAndMerge(path.dirname(STATUS_PATH), PROJECT_ROOT)
+          if (ssePayload) broadcastSSE(ssePayload)
+        } catch {}
+      }
+    })
+    return
+  }
+
+  res.setHeader('Allow', 'GET, POST, OPTIONS')
+  res.statusCode = 405
+  res.end(JSON.stringify({ error: 'Method not allowed' }))
+}
+
+// ─── /api/lang ────────────────────────────────────────────────────────────────
+function handleLang(req, res) {
+  res.setHeader('Content-Type', 'application/json')
+  res.setHeader('Cache-Control', 'no-store')
+  setCors(res, req.headers.origin, 'POST, OPTIONS')
+  if (req.method === 'OPTIONS') return handlePreflight(req, res)
+  if (req.method !== 'POST') { res.setHeader('Allow', 'POST, OPTIONS'); res.statusCode = 405; return res.end(JSON.stringify({ error: 'Method not allowed' })) }
+  const reqOriginL = req.headers.origin
+  if (reqOriginL && !isAllowedOrigin(reqOriginL)) { res.statusCode = 403; return res.end(JSON.stringify({ ok: false, error: 'Origin not allowed' })) }
+  if (!isAuthorized(req)) { res.statusCode = 401; return res.end(JSON.stringify({ ok: false, error: 'Unauthorized' })) }
+  if (!checkRateLimit(req)) { res.statusCode = 429; return res.end(JSON.stringify({ ok: false, error: 'Too many requests' })) }
+  req.setEncoding('utf-8')
+  let body = '', aborted = false, receivedBytes = 0
+  req.on('data', chunk => {
+    if (aborted) return
+    receivedBytes += Buffer.byteLength(chunk, 'utf8')
+    if (receivedBytes > 16) { aborted = true; res.statusCode = 413; res.end(JSON.stringify({ ok: false, error: 'Body too large' })); req.resume(); return }
+    body += chunk
+  })
+  req.on('end', () => {
+    if (aborted) return
+    const l = body.trim()
+    if (l !== 'en' && l !== 'zh-TW') { res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'Invalid lang' })) }
+    const langFile = path.join(os.homedir(), '.claude', 'office-lang')
+    try {
+      const dir = path.dirname(langFile)
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+      if (!atomicWrite(langFile, l)) { res.statusCode = 500; return res.end(JSON.stringify({ ok: false, error: 'Write failed' })) }
+      res.end(JSON.stringify({ ok: true }))
+    } catch { res.statusCode = 500; res.end(JSON.stringify({ ok: false })) }
+  })
+}
+
+// ─── /api/event ───────────────────────────────────────────────────────────────
+const EVENT_TO_STATUS = {
+  'pr-merged':         [{ role: 'ops', status: 'done',    label: '🚀 PR merged!' }, { role: 'dev', status: 'done', label: '✅ Shipped!' }],
+  'pr-opened':         [{ role: 'dev', status: 'working', label: '📋 PR opened' }],
+  'pr-reviewed':       [{ role: 'qa',  status: 'done',    label: '✅ PR reviewed' }],
+  'test-passed':       [{ role: 'qa',  status: 'done',    label: '✅ Tests passed!' }],
+  'test-failed':       [{ role: 'qa',  status: 'blocked', label: '❌ Tests failed' }],
+  'build-success':     [{ role: 'ops', status: 'done',    label: '🏗️ Build success' }],
+  'build-failed':      [{ role: 'ops', status: 'blocked', label: '💥 Build failed' }],
+  'deploy-start':      [{ role: 'ops', status: 'working', label: '🚀 Deploying...' }],
+  'deploy-success':    [{ role: 'ops', status: 'done',    label: '🎉 Deployed!' }],
+  'deploy-failed':     [{ role: 'ops', status: 'blocked', label: '💥 Deploy failed' }],
+  'release':           [{ role: 'ops', status: 'done',    label: '🎉 Released!' }, { role: 'dev', status: 'done', label: '🎉 Ship it!' }, { role: 'qa', status: 'done', label: '✅ Quality approved' }],
+  'review-approved':   [{ role: 'qa',  status: 'done',    label: '✅ Review approved' }],
+  'release-cut':       [{ role: 'ops', status: 'working', label: '📦 Cutting release...' }],
+  'rollback':          [{ role: 'ops', status: 'blocked', label: '⏪ Rolling back' }],
+  'incident-start':    [{ role: 'ops', status: 'blocked', label: '🚨 Incident started' }, { role: 'dev', status: 'working', label: '🔥 Investigating...' }],
+  'incident-resolved': [{ role: 'ops', status: 'done',    label: '✅ Incident resolved' }],
+}
+
+function handleEvent(req, res) {
+  res.setHeader('Content-Type', 'application/json')
+  res.setHeader('Cache-Control', 'no-store')
+  setCors(res, req.headers.origin, 'POST, OPTIONS')
+  if (req.method === 'OPTIONS') return handlePreflight(req, res)
+  if (req.method !== 'POST') { res.setHeader('Allow', 'POST, OPTIONS'); res.statusCode = 405; return res.end(JSON.stringify({ error: 'Method not allowed' })) }
+  const reqOriginE = req.headers.origin
+  if (reqOriginE && !isAllowedOrigin(reqOriginE)) { res.statusCode = 403; return res.end(JSON.stringify({ ok: false, error: 'Origin not allowed' })) }
+  if (!isAuthorized(req)) { res.statusCode = 401; return res.end(JSON.stringify({ ok: false, error: 'Unauthorized' })) }
+  if (!checkRateLimit(req)) { res.statusCode = 429; return res.end(JSON.stringify({ ok: false, error: 'Too many requests' })) }
+  req.setEncoding('utf-8')
+  let body = '', aborted = false, receivedBytes = 0
+  req.on('data', chunk => {
+    if (aborted) return
+    receivedBytes += Buffer.byteLength(chunk, 'utf8')
+    if (receivedBytes > 8192) { aborted = true; res.statusCode = 413; res.end(JSON.stringify({ ok: false, error: 'Payload too large' })); req.resume(); return }
+    body += chunk
+  })
+  req.on('end', () => {
+    if (aborted) return
+    let eventName = ''
+    let agents
+    try {
+      const parsed = JSON.parse(body)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'Invalid payload' }))
+      }
+      eventName = typeof parsed.event === 'string' ? parsed.event : ''
+      if (eventName === 'custom' && parsed.role && parsed.status) {
+        if (!VALID_ROLES.includes(parsed.role) || !VALID_STATUSES.includes(parsed.status)) {
+          res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'Invalid role or status' }))
+        }
+        agents = [{ role: parsed.role, status: parsed.status, label: typeof parsed.label === 'string' ? parsed.label.slice(0, 200) : eventName.slice(0, 200) }]
+      } else {
+        agents = Object.prototype.hasOwnProperty.call(EVENT_TO_STATUS, eventName) ? EVENT_TO_STATUS[eventName] : undefined
+        if (!agents) { res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'Unknown event' })) }
+        if (typeof parsed.label === 'string') agents = agents.map((a, i) => i === 0 ? { ...a, label: parsed.label.slice(0, 200) } : a)
+      }
+      const output = {
+        _seq: nextSeq(),
+        type: 'office-status', agents,
+        activeCount: countActive(agents),
+        workflow: typeof parsed.workflow === 'string' ? parsed.workflow.slice(0, 200) : null,
+        source: 'webhook',
+        _cwd: PROJECT_ROOT,
+      }
+      if (!atomicWrite(STATUS_PATH, JSON.stringify(output, null, 2))) {
+        res.statusCode = 500; return res.end(JSON.stringify({ ok: false, error: 'Write failed' }))
+      }
+    } catch { res.statusCode = 400; res.end(JSON.stringify({ ok: false, error: 'Invalid JSON' })); return }
+    // Write succeeded — respond before the best-effort SSE broadcast so a scanAndMerge or
+    // broadcastSSE failure cannot misreport a persisted event as a 400.
+    res.end(JSON.stringify({ ok: true, event: eventName, agents: agents.length }))
+    // Skip the broadcast scan when no SSE clients are connected (see /api/status POST).
+    if (sseClients.size > 0) {
+      try {
+        const ssePayload = scanAndMerge(path.dirname(STATUS_PATH), PROJECT_ROOT)
+        if (ssePayload) broadcastSSE(ssePayload)
+      } catch {}
+    }
+  })
+}
+
+// ─── Static file serving (SPA-aware) ─────────────────────────────────────────
+const MIME = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript',
+  '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml',
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
+  '.gif': 'image/gif', '.ico': 'image/x-icon',
+  '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf',
+}
+
+function serveStatic(req, res) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') { res.setHeader('Allow', 'GET, HEAD'); res.statusCode = 405; return res.end() }
+  const parsedUrl = safeParseUrl(req.url)
+  if (!parsedUrl) { res.statusCode = 400; return res.end('Bad Request') }
+  const urlPath = parsedUrl.pathname
+  // Reject NUL bytes which can cause filesystem misbehavior on some platforms.
+  if (urlPath.includes('\0')) { res.statusCode = 400; return res.end('Bad Request') }
+  let target = path.join(dist, urlPath)
+
+  // Path traversal guard — use sep to prevent dist-single/dist-evil siblings matching
+  if (target !== dist && !target.startsWith(dist + path.sep)) { res.statusCode = 403; return res.end('Forbidden') }
+
+  if (fs.existsSync(target) && fs.statSync(target).isDirectory()) target = path.join(target, 'index.html')
+  if (!fs.existsSync(target)) {
+    // 404 for missing files with extensions (hashed chunk deploy-skew) — SPA fallback only for routes
+    if (path.extname(urlPath)) { res.statusCode = 404; return res.end('Not Found') }
+    target = path.join(dist, 'index.html')
+  }
+
+  // Resolve symlinks and re-check containment to block symlink traversal inside dist/.
+  // On realpathSync failure (broken symlink, TOCTOU race) return 403 rather than
+  // continuing with the unresolved path which may bypass the containment check.
+  let realTarget
+  try { realTarget = fs.realpathSync(target) } catch { res.statusCode = 403; return res.end('Forbidden') }
+  if (realTarget !== dist && !realTarget.startsWith(dist + path.sep)) { res.statusCode = 403; return res.end('Forbidden') }
+
+  const ext = path.extname(target).toLowerCase()
+  const mime = MIME[ext] || 'application/octet-stream'
+  try {
+    const content = fs.readFileSync(target)
+    const etag = '"' + createHash('md5').update(content).digest('hex').slice(0, 12) + '"'
+    if (req.headers['if-none-match'] === etag) { res.statusCode = 304; return res.end() }
+    res.setHeader('Content-Type', mime)
+    res.setHeader('ETag', etag)
+    // Immutable cache for hashed assets, no-cache for HTML
+    if (mime.startsWith('text/html')) {
+      res.setHeader('Cache-Control', 'no-cache')
+      res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'")
+    }
+    else if (/[._-][A-Za-z0-9_-]{8,}\./.test(path.basename(target))) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+    res.statusCode = 200
+    return req.method === 'HEAD' ? res.end() : res.end(content)
+  } catch { res.statusCode = 500; return res.end('Internal Error') }
+}
+
+// ─── HTTP server ──────────────────────────────────────────────────────────────
+const SERVER_START = Date.now()
+
+const server = http.createServer((req, res) => {
+  // Swallow client-abort / ECONNRESET so they don't crash the process.
+  req.on('error', () => {})
+  res.on('error', () => {})
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+
+  // F3: reject requests whose Host header doesn't resolve to an allowed host BEFORE any
+  // routing — closes the DNS-rebinding read across every route (API, SSE, and static assets
+  // alike; Vite's own dev-server host guard applies the same way for consistency). EXEMPT: a
+  // request carrying a valid OFFICE_API_TOKEN (see hasValidApiToken's comment) — a
+  // rebinding browser cannot know that token, so proof of it is proof the caller is a
+  // deliberate integration, not a victim's browser.
+  if (!isAllowedHost(req.headers.host) && !hasValidApiToken(req)) {
+    logRejectedHostOnce(req.headers.host)
+    res.statusCode = 403
+    return res.end('Forbidden: Host not allowed. Set OFFICE_ALLOWED_HOSTS to permit additional hostnames.')
+  }
+
+  // F1: never let a malformed request-target's `new URL()` throw escape this callback —
+  // req/res 'error' listeners above do not catch a synchronous throw in the listener body.
+  const url = safeParseUrl(req.url)
+  if (!url) { res.statusCode = 400; return res.end('Bad Request') }
+  if (url.pathname === '/api/status') return handleStatus(req, res)
+  if (url.pathname === '/api/status/stream') {
+    setCors(res, req.headers.origin, 'GET, OPTIONS')
+    if (req.method === 'OPTIONS') return handlePreflight(req, res)
+    if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); res.statusCode = 405; return res.end() }
+    if (sseClients.size >= MAX_SSE_CLIENTS) {
+      res.statusCode = 503
+      return res.end('Too many concurrent SSE clients. Set OFFICE_MAX_SSE_CLIENTS to raise the limit.')
+    }
+    // F2: SSE connections are long-lived by design. `server.setTimeout(30000)` below applies
+    // a 30s idle-socket timeout to every connection, and the heartbeat interval below also
+    // fires every 30s — the two clocks aren't phase-locked, so roughly every other heartbeat
+    // window the socket goes idle for the full 30s first and gets destroyed, dropping the
+    // stream ~every 60s (client then reconnects, briefly reporting degraded integration
+    // health — src/inference/inferStatus.js's onerror path). Disabling the per-socket
+    // timeout here is scoped to ONLY this route: headersTimeout/requestTimeout (slowloris
+    // guards) and the 30s default for every other request are untouched.
+    req.socket?.setTimeout(0)
+    res.setHeader('Content-Type', 'text/event-stream')
+    res.setHeader('Cache-Control', 'no-cache')
+    res.setHeader('X-Accel-Buffering', 'no')
+    res.flushHeaders?.()
+    sseClients.add(res)
+    req.on('close', () => sseClients.delete(res))
+    req.on('error', () => sseClients.delete(res))
+    res.on('error', () => sseClients.delete(res))
+    // try/catch: an uncaught scanAndMerge throw in this request handler would crash the
+    // server (req/res 'error' listeners don't catch synchronous handler-body throws).
+    let snapshot = null
+    try { snapshot = scanAndMerge(path.dirname(STATUS_PATH), PROJECT_ROOT) } catch {}
+    if (snapshot) {
+      try { res.write(`event: status\ndata: ${publicStatusJson(snapshot)}\n\n`) }
+      catch { sseClients.delete(res) }
+    }
+    return
+  }
+  if (url.pathname === '/api/lang')   return handleLang(req, res)
+  if (url.pathname === '/api/event')  return handleEvent(req, res)
+  if (url.pathname === '/api/health') {
+    res.setHeader('Content-Type', 'application/json')
+    res.setHeader('Cache-Control', 'no-store')
+    setCors(res, req.headers.origin, 'GET, OPTIONS')
+    if (req.method === 'OPTIONS') return handlePreflight(req, res)
+    if (req.method !== 'GET' && req.method !== 'HEAD') { res.setHeader('Allow', 'GET, HEAD, OPTIONS'); res.statusCode = 405; return res.end() }
+    const stats = getSessionStats(path.dirname(STATUS_PATH), PROJECT_ROOT)
+    return res.end(JSON.stringify({ ok: true, uptime: Math.floor(process.uptime()), ...stats }))
+  }
+  return serveStatic(req, res)
+})
+
+// Timeout hardening: headersTimeout defends against slowloris; requestTimeout
+// catches hung uploads; keepAliveTimeout bounds idle keep-alive sockets.
+server.setTimeout(30000)
+server.headersTimeout = 15000   // headers must arrive within 15s
+server.requestTimeout = 30000   // full request within 30s
+server.keepAliveTimeout = 10000
+server.maxHeadersCount = 100
+
+server.listen(port, bindHost, () => {
+  const displayHost = bindHost === '0.0.0.0' ? 'localhost' : bindHost
+  const url = `http://${displayHost}:${port}${lang ? `?lang=${lang}` : ''}`
+  const lanIp = bindHost === '0.0.0.0'
+    ? [...SERVER_IPS].find(ip => !['localhost', '127.0.0.1', '[::1]'].includes(ip))
+    : null
+  const lanLine = lanIp ? `\n  LAN:     http://${lanIp}:${port}` : ''
+
+  console.log(`
+  Agent Virtual Office (production build)
+  Local:   ${url}
+  Panel:   ${url}${lang ? '&' : '?'}mode=panel
+  API:     http://${displayHost}:${port}/api/status${lanLine}
+
+  Use Ctrl+C to stop.
+  `)
+
+  // Announce a redirected status directory: a forgotten OFFICE_STATUS_DIR would otherwise
+  // present an empty/stale office as if it were live, with nothing on screen saying why.
+  if (process.env.OFFICE_STATUS_DIR) {
+    console.log(`  Status directory overridden by OFFICE_STATUS_DIR: ${STATUS_DIR}
+`)
+  }
+
+  if (bindHost === '0.0.0.0' && !apiToken) {
+    console.warn('  WARNING: --host is set but OFFICE_API_TOKEN is not.')
+    console.warn('  Anyone on the network can write to /api/status without authentication.')
+    console.warn('  Set OFFICE_API_TOKEN=<secret> to require a token for writes.\n')
+  }
+
+  // Open browser
+  if (openBrowser) {
+    const opener = process.platform === 'win32' ? 'start' : process.platform === 'darwin' ? 'open' : 'xdg-open'
+    if (opener === 'xdg-open' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+      console.log(`  Open in browser: ${url}`)
+    } else {
+      try {
+        const cmd = opener === 'start' ? `start "" "${url}"` : `${opener} "${url}"`
+        execSync(cmd, { stdio: 'ignore' })
+      } catch { console.log(`  Open in browser: ${url}`) }
+    }
+  }
+})
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') console.error(`\n  Port ${port} is already in use. Try --port=${port + 1}\n`)
+  else console.error('\n  Server error:', err.message, '\n')
+  process.exit(1)
+})
+
+// Watch ~/.claude/ for hook-written status file changes and broadcast via SSE.
+// Hooks write directly to disk (not through POST), so fs.watch is the only way
+// to push those updates to connected SSE clients without polling.
+// M2: hoisted so gracefulShutdown can close the watcher and clear the debounce timer.
+let _watcherHandle = null
+let _watchDebounce = null
+{
+  const watchDir = path.dirname(STATUS_PATH)
+  try {
+    if (!fs.existsSync(watchDir)) fs.mkdirSync(watchDir, { recursive: true })
+    _watcherHandle = fs.watch(watchDir, { persistent: false }, (event, filename) => {
+      if (!filename || !filename.match(/^office-status(-[^.]+)?\.json$/)) return
+      if (sseClients.size === 0) return
+      clearTimeout(_watchDebounce)
+      _watchDebounce = setTimeout(() => {
+        // try/catch: this runs in a timer callback with NO outer guard, so an uncaught throw
+        // (e.g. a malformed session file reaching scanAndMerge) would crash the whole server
+        // process. Mirrors the POST-broadcast caller's guard above.
+        try {
+          const merged = scanAndMerge(watchDir, PROJECT_ROOT)
+          if (merged) broadcastSSE(merged)
+        } catch {}
+      }, 80)  // debounce: atomic rename fires two events on some platforms
+    })
+  } catch {}
+}
+
+// ─── Stale session cleanup (runs every 10 min, not in the GET hot path) ──────
+setInterval(() => {
+  try {
+    const dir = path.dirname(STATUS_PATH)
+    if (!fs.existsSync(dir)) return
+    const now = Date.now()
+
+    // Sweep rate-limiter map while we're here (avoids unbounded growth under IP rotation).
+    const cutoff = now - RATE_WINDOW
+    for (const [k, v] of postCounts) {
+      const fresh = Array.isArray(v) ? v.filter(t => t >= cutoff) : []
+      if (fresh.length === 0) postCounts.delete(k)
+      else postCounts.set(k, fresh)
+    }
+
+    for (const file of fs.readdirSync(dir)) {
+      if (file === 'office-status.json') continue           // never auto-delete main
+      const isStatus = /^office-status-[^.]+\.json$/.test(file)
+      const isSkill  = /^office-skill-[^.]+\.json$/.test(file)
+      // Clean up orphan temp files left by EBUSY rename failures.
+      const isTmp = /^office-(?:status|skill|lang).*\.tmp\.\d+\.[a-z0-9]+$/.test(file)
+      if (!isStatus && !isSkill && !isTmp) continue
+      try {
+        if (isTmp || isSkill) {
+          // skill/tmp files have no _seq — use mtime (10-min TTL for tmp, 1h for skill)
+          const { mtimeMs } = fs.statSync(path.join(dir, file))
+          const ttl = isTmp ? 600_000 : 3_600_000
+          if (now - mtimeMs > ttl) fs.unlinkSync(path.join(dir, file))
+        } else {
+          let seq = NaN
+          try { seq = parseInt(JSON.parse(fs.readFileSync(path.join(dir, file), 'utf-8'))._seq, 10) } catch {}
+          const age = Number.isFinite(seq) ? now - seq : now - fs.statSync(path.join(dir, file)).mtimeMs
+          if (age > 3_600_000) fs.unlinkSync(path.join(dir, file))
+        }
+      } catch {}
+    }
+  } catch {}
+}, 600_000).unref()
+
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
+// server.close() stops accepting new connections but is async — it fires its
+// callback only after all in-flight requests finish. closeIdleConnections()
+// (Node >= 18.2) immediately frees idle keep-alive sockets so close() doesn't
+// hang waiting for them. The hard-exit timer guards against requests that never
+// complete (e.g. a hung upstream or a client that never reads its response).
+let _shuttingDown = false
+function gracefulShutdown(signal) {
+  if (_shuttingDown) return
+  _shuttingDown = true
+  antigravityWatcher.stop()
+  console.log(`\n  ${signal} received — draining in-flight requests...`)
+
+  // M1: stop SSE heartbeat; M2: stop file watcher and pending debounce
+  clearInterval(_sseHeartbeat)
+  clearTimeout(_watchDebounce)
+  if (_watcherHandle) { try { _watcherHandle.close() } catch {} }
+
+  // B7a: end all open SSE streams so server.close() doesn't wait for them
+  // (SSE responses are never-ending — without this, close() hangs until the 10s hard-exit)
+  for (const c of [...sseClients]) { try { c.end() } catch {} }
+  sseClients.clear()
+
+  server.close((err) => {
+    if (err) { console.error('  Server close error:', err.message); process.exit(1) }
+    console.log('  All connections drained. Exiting cleanly.')
+    process.exit(0)
+  })
+
+  // Drop idle keep-alive sockets so server.close() can actually complete.
+  server.closeIdleConnections?.()
+
+  // Hard cap: if requests don't finish in 10s, force exit so the orchestrator's
+  // own SIGKILL timeout (systemd TimeoutStopSec=15, PM2 kill_timeout:15000)
+  // isn't the first line of defence. NOT unref()'d — this timer MUST fire.
+  setTimeout(() => {
+    console.error('  Drain timed out (10s) — forcing exit.')
+    server.closeAllConnections?.()
+    process.exit(1)
+  }, 10_000)
+}
+
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'))
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+// Sync last-resort cleanup for Windows where SIGTERM doesn't fire
+// (PM2, taskkill, nssm kill the process without emitting SIGTERM).
+process.on('exit', () => {
+  antigravityWatcher.stop()
+  try { _watcherHandle?.close() } catch {}
+  try { if (_watchDebounce) clearTimeout(_watchDebounce) } catch {}
+})

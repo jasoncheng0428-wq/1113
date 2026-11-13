@@ -1,0 +1,188 @@
+import { describe, it, expect } from 'vitest'
+import {
+  collectArrivalNudgeClaims,
+  createDoorJourneyId,
+  hasRafHandle,
+  isDocumentFocused,
+  RAF_STALL_RESTART_MS,
+  scheduleRemovedWalkAbort,
+  shouldAbortExpiredDoorClaim,
+  shouldRecordRafWatchdogRestart,
+  shouldRestartRafWatchdog,
+  shouldRestoreWalk,
+  shouldStopStaleLocalWalk,
+} from '../src/components/AgentCharacter.jsx'
+import { GAP_SNAP_MS } from '../src/systems/walkFrame.js'
+
+describe('shouldRestartRafWatchdog', () => {
+  it('ignores hidden tabs so browser throttling does not create false diagnostics', () => {
+    expect(shouldRestartRafWatchdog(1000, 1000 + GAP_SNAP_MS + 1, 'hidden')).toBe(false)
+  })
+
+  it('does not restart for visible jank inside the smooth-resume window', () => {
+    expect(shouldRestartRafWatchdog(1000, 1000 + RAF_STALL_RESTART_MS, 'visible')).toBe(false)
+  })
+
+  it('restarts the lost RAF chain before the long-freeze snap boundary', () => {
+    expect(RAF_STALL_RESTART_MS).toBeLessThan(GAP_SNAP_MS)
+    expect(shouldRestartRafWatchdog(1000, 1000 + RAF_STALL_RESTART_MS + 1, 'visible')).toBe(true)
+    expect(shouldRestartRafWatchdog(1000, 1000 + GAP_SNAP_MS, 'visible')).toBe(true)
+  })
+
+  it('does not restart before the first RAF timestamp is recorded', () => {
+    expect(shouldRestartRafWatchdog(0, 999999, 'visible')).toBe(false)
+    expect(shouldRestartRafWatchdog(NaN, 999999, 'visible')).toBe(false)
+  })
+})
+
+describe('shouldRecordRafWatchdogRestart', () => {
+  it('does not count host-throttled pending frames as an app fault', () => {
+    expect(shouldRecordRafWatchdogRestart(true, true, 3)).toBe(false)
+  })
+
+  it('does not count recoverable lost chains while the document is not focused', () => {
+    expect(shouldRecordRafWatchdogRestart(false, false, 5)).toBe(false)
+  })
+
+  it('records the first focused lost-chain restart', () => {
+    expect(shouldRecordRafWatchdogRestart(false, true, 0)).toBe(false)
+    expect(shouldRecordRafWatchdogRestart(false, true, 1)).toBe(true)
+    expect(shouldRecordRafWatchdogRestart(false, true, 2)).toBe(true)
+  })
+})
+
+describe('isDocumentFocused', () => {
+  it('requires a real focused document', () => {
+    expect(isDocumentFocused({ hasFocus: () => true })).toBe(true)
+    expect(isDocumentFocused({ hasFocus: () => false })).toBe(false)
+  })
+
+  it('treats missing focus APIs as not focused', () => {
+    expect(isDocumentFocused({})).toBe(false)
+    expect(isDocumentFocused(null)).toBe(false)
+  })
+})
+
+describe('hasRafHandle', () => {
+  it('treats 0 as a valid requestAnimationFrame handle', () => {
+    expect(hasRafHandle(0)).toBe(true)
+  })
+
+  it('uses only nullish values as the empty sentinel', () => {
+    expect(hasRafHandle(null)).toBe(false)
+    expect(hasRafHandle(undefined)).toBe(false)
+    expect(hasRafHandle(42)).toBe(true)
+  })
+})
+
+// React tears passive effects down on LIVE components (a depth-sorted keyed list re-places
+// fibers on every walk; StrictMode then double-invokes them). The teardown kills the rAF and
+// releases the journey claim, so the setup must put a still-live walk back together — measured
+// at 22 spurious teardowns per 150s, each freezing a walker for ~3000ms, which is exactly the
+// soak's STACK_SUSTAIN_MS.
+describe('shouldRestoreWalk', () => {
+  const pos = { x: 10, y: 20 }
+
+  it('restores a walk whose rAF chain was cancelled by a teardown', () => {
+    expect(shouldRestoreWalk(true, pos, pos, null)).toBe(true)
+  })
+
+  it('never starts a second chain when one is already live', () => {
+    expect(shouldRestoreWalk(true, pos, pos, 42)).toBe(false)
+    expect(shouldRestoreWalk(true, pos, pos, 0)).toBe(false)  // 0 is a valid rAF handle
+  })
+
+  it('never republishes a walk that already ended', () => {
+    expect(shouldRestoreWalk(false, pos, pos, null)).toBe(false)
+  })
+
+  it('declines when the walk has no position or target to resume from', () => {
+    expect(shouldRestoreWalk(true, null, pos, null)).toBe(false)
+    expect(shouldRestoreWalk(true, pos, null, null)).toBe(false)
+  })
+})
+
+describe('shouldAbortExpiredDoorClaim', () => {
+  const granted = { state: 'granted', deadlineAt: 5000 }
+
+  it('aborts only a visible granted claim after its deadline', () => {
+    expect(shouldAbortExpiredDoorClaim(granted, 5001, 'visible')).toBe(true)
+    expect(shouldAbortExpiredDoorClaim(granted, 5000, 'visible')).toBe(false)
+  })
+
+  it('never transfers ownership while the document is hidden or the request is queued', () => {
+    expect(shouldAbortExpiredDoorClaim(granted, 9000, 'hidden')).toBe(false)
+    expect(shouldAbortExpiredDoorClaim({ state: 'queued', deadlineAt: 1 }, 9000, 'visible')).toBe(false)
+    expect(shouldAbortExpiredDoorClaim(null, 9000, 'visible')).toBe(false)
+  })
+})
+
+describe('createDoorJourneyId', () => {
+  it('creates stable fencing-token shapes without reusing a journey id', () => {
+    const first = createDoorJourneyId('dev')
+    const second = createDoorJourneyId('dev')
+    expect(first).toMatch(/^dev:door:\d+$/)
+    expect(second).toMatch(/^dev:door:\d+$/)
+    expect(second).not.toBe(first)
+  })
+})
+
+describe('scheduleRemovedWalkAbort', () => {
+  it('aborts a true removal at a defensive copy of the rendered position', async () => {
+    const isUnmountedRef = { current: true }
+    const position = { x: 123, y: 234 }
+    let stoppedAt = null
+
+    scheduleRemovedWalkAbort(isUnmountedRef, position, (next) => { stoppedAt = next })
+    position.x = 999
+    await Promise.resolve()
+
+    expect(stoppedAt).toEqual({ x: 123, y: 234 })
+    expect(stoppedAt).not.toBe(position)
+  })
+
+  it('does not abort a live teardown that reconnects in the same flush', async () => {
+    const isUnmountedRef = { current: true }
+    let called = false
+
+    scheduleRemovedWalkAbort(isUnmountedRef, { x: 1, y: 2 }, () => { called = true })
+    isUnmountedRef.current = false
+    await Promise.resolve()
+
+    expect(called).toBe(false)
+  })
+})
+
+describe('collectArrivalNudgeClaims', () => {
+  it('treats moving agents current-leg and journey-end targets as arrival blockers', () => {
+    const claims = collectArrivalNudgeClaims({
+      arch: { position: { x: 460, y: 364 }, isMoving: false },
+      ops: {
+        position: { x: 430, y: 360 },
+        targetPosition: { x: 470, y: 369 },
+        journeyTarget: { x: 460, y: 364 },
+        isMoving: true,
+      },
+    }, 'arch')
+
+    expect(claims.blockers).toContainEqual({ x: 470, y: 369 })
+    expect(claims.blockers).toContainEqual({ x: 460, y: 364 })
+    expect(claims.claims).toContainEqual({ x: 470, y: 369 })
+    expect(claims.claims).toContainEqual({ x: 460, y: 364 })
+  })
+})
+
+describe('shouldStopStaleLocalWalk', () => {
+  it('stops local walking when the authoritative store says the agent is no longer moving', () => {
+    expect(shouldStopStaleLocalWalk(true, { isMoving: false })).toBe(true)
+  })
+
+  it('does not stop an active authoritative walk', () => {
+    expect(shouldStopStaleLocalWalk(true, { isMoving: true })).toBe(false)
+  })
+
+  it('does nothing when local walking is already off or the agent is absent', () => {
+    expect(shouldStopStaleLocalWalk(false, { isMoving: false })).toBe(false)
+    expect(shouldStopStaleLocalWalk(true, null)).toBe(false)
+  })
+})

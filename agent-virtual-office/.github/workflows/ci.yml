@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feat/*]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # engines requires >=22 and Node 20 is EOL — the matrix tests what we support.
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      # npm ci (not install): exact-lockfile reproducible builds — CI must test the
+      # tree the lockfile pins, not whatever resolution npm install computes today.
+      - run: npm ci
+      # Build BEFORE test: the transport-spine e2e (AVO-150) boots the real
+      # server.mjs, which refuses to start without dist/index.html.
+      - run: npm run build
+      # AVO-152: bundle-size budget — fails on >+10% vs the committed baseline
+      # (re-base scripts/bundle-budget.json intentionally when growth is justified).
+      - run: node scripts/bundle-budget.mjs
+      - run: npm test
+
+  render-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run smoke
+      - run: npm run smoke:panel
+      - name: Spawn soak smoke
+        run: npm run soak:spawn -- --minutes 0.05
+
+  pack-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run smoke:pack
+
+  # The Dockerfile shipped a runner stage that omitted server.mjs's import closure, so every
+  # container exited on startup with ERR_MODULE_NOT_FOUND -- while the build, the full test
+  # suite and all three smoke gates stayed green. Nothing we ran could see it, because nothing
+  # we ran was the image. tests/dockerRuntimeClosure.test.js catches the static half (an import
+  # reaching outside what the runner copies); this job catches everything else -- a bad CMD, a
+  # missing dist/index.html, a HEALTHCHECK pointed at the wrong path -- by actually running it.
+  docker-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t agent-virtual-office:ci .
+      - name: Boot the container and wait for its own HEALTHCHECK to report healthy
+        run: |
+          set -euo pipefail
+          # No port publishing: the healthcheck runs INSIDE the container, which is what a real
+          # deployment relies on, and nothing needs to be exposed to the runner to observe it.
+          docker run -d --name avo-ci -e OFFICE_API_TOKEN=ci-smoke agent-virtual-office:ci
+          for i in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' avo-ci 2>/dev/null || echo missing)
+            state=$(docker inspect -f '{{.State.Status}}' avo-ci 2>/dev/null || echo missing)
+            echo "attempt $i: state=$state health=$status"
+            if [ "$status" = healthy ]; then echo "container is healthy"; exit 0; fi
+            # Fail fast rather than burning the full timeout on a container that already died.
+            if [ "$state" != running ]; then
+              echo "::error::container is not running (state=$state) -- startup crash:"
+              docker logs avo-ci
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::container never reported healthy within 60s"
+          docker logs avo-ci
+          exit 1
+      - name: Container logs
+        if: always()
+        run: docker logs avo-ci || true
+      - name: Stop
+        if: always()
+        run: docker rm -f avo-ci || true

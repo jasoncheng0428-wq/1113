@@ -1,0 +1,83 @@
+name: Security Scanning
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Semgrep
+        run: pip install semgrep==1.123.0
+
+      # Two passes since 2026-06-11 (#126 — baseline triaged, see
+      # docs/reviews/2026-06-11-semgrep-baseline.md):
+      #  1. Full scan stays REPORT-ONLY — WARNING/INFO findings surface as annotations
+      #     without failing CI (all current ones are triaged-accepted by design).
+      #  2. ERROR-severity scan BLOCKS (--error): the 2 baseline ERROR findings were
+      #     fixed (workflow env indirection) or scope-suppressed with justification
+      #     (sim-soak spawn), so any NEW ERROR-severity finding fails this job.
+      # `--config auto` tracks the registry — a registry-added ERROR rule failing here
+      # is the intended "new serious finding" tripwire; triage it, don't loosen the gate.
+      - name: Run Semgrep (full, report-only)
+        run: semgrep --config auto .
+
+      - name: Run Semgrep (ERROR severity, blocking)
+        run: semgrep --config auto --severity ERROR --error .
+
+  trufflehog:
+    name: Secret Detection (TruffleHog)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # --only-verified keeps false positives near zero: only credentials that
+      # verify against a live service fail the job.
+      - name: Scan for secrets
+        uses: trufflesecurity/trufflehog@37b77001d0174ebec2fcca2bd83ff83a6d45a3ab  # v3.95.3
+        with:
+          extra_args: --only-verified
+
+  dependency-audit:
+    name: Dependency Audit (npm audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # ENFORCED since 2026-06-11 (quality wave Q3): the tree was triaged + fixed
+      # (vite/vitest/picomatch/postcss advisories resolved via npm audit fix), so
+      # high+ advisories now FAIL the job instead of printing a table nobody reads.
+      - name: Audit npm dependencies
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm audit --audit-level=high
+          else
+            echo "::warning::dependency-audit: no package-lock.json at repo root — npm audit skipped"
+          fi

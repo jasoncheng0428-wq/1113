@@ -1,0 +1,201 @@
+/**
+ * #C — Idle-gap inference: close Pixel Agents' admitted heuristic gap.
+ *
+ * When an agent's status has not received a hook update for a long time,
+ * infer a non-emitted Claude/Codex thinking state that the office should
+ * still visualize:
+ *
+ *   working + no update for ≥ 45s   →  status = 'thinking'
+ *       (Claude is in extended thinking, no PreToolUse fires meanwhile)
+ *
+ * Conservative on purpose: a normal 30-60s Bash test can produce no
+ * intermediate events. The 45s threshold catches genuinely stalled work
+ * while a 30s threshold (e.g. Pixel Agents-style) would misfire on every
+ * test run. A blocked status remains blocked until a real lifecycle event
+ * changes it; elapsed time alone cannot prove that permission is pending.
+ *
+ * Reversibility: any real hook event flows through `applyExternalStatus`
+ * which simply overwrites the status; the inferred state has no marker
+ * to clean up. Thrashing is prevented structurally: inference only fires
+ * for 'working', so once a tick flips the status to 'thinking' the branch
+ * no longer matches.
+ *
+ * lastUpdatedAt tracking: zustand subscribe captures every state change
+ * to `agents`. We stamp the current time whenever an agent's status or
+ * task field changes (not on position/behavior — those tick organically).
+ *
+ * Polling cadence: 10s. Coarser than #8 (5s) since the working threshold is
+ * 45s, so fewer chances are needed and we save wakeups.
+ *
+ * rem-honest-office-events (2026-09-26): the update now carries the agent's own prior
+ * externalStatus fields (task/label/activeFile/reasonCode/skill/hint) forward instead of
+ * sending {agentId, status} alone — otherwise store.js's buildExtEntry wipes them to null on
+ * every inferred tick. store.js also keeps `changedAt` unchanged and skips the new-bubble pop
+ * for `source: 'idle-gap-infer'` updates, since a heuristic re-interpretation of silence is not
+ * a fresh real signal.
+ */
+
+import { AGENT_CARRY_FIELDS } from '../utils/statusFields.js'
+
+const WORKING_GAP_MS = 45_000   // 45s → thinking
+const POLL_INTERVAL_MS = 10_000
+
+// Map of agentId → last meaningful update timestamp. Survives across
+// reactivity because the polling loop keeps a stable reference.
+const lastUpdatedAt = new Map()
+
+// rem-honest-office-events finding #2: an inferred update used to send ONLY {agentId, status}.
+// store.js's buildExtEntry writes `u[f] || null` for every AGENT_CARRY_FIELDS entry, so
+// task/label/activeFile/reasonCode/skill/hint were WIPED to null on every inference — even
+// though nothing about the agent's real task changed, only how long it has been silent. Carry
+// the agent's own prior externalStatus fields through so an inferred status change looks like
+// exactly what it is: the SAME task, now visualized as a stall, not a fresh unrelated update.
+function inferredUpdate(agentId, status, prevExt) {
+  const u = { agentId, status }
+  if (prevExt) {
+    for (const f of AGENT_CARRY_FIELDS) {
+      if (prevExt[f] != null) u[f] = prevExt[f]
+    }
+  }
+  return u
+}
+
+function tick(store, opts, now = Date.now) {
+  const t0 = now()
+  const state = store.getState()
+  const agents = state.agents
+  const externalStatus = state.externalStatus || {}
+  const updates = []
+  for (const id of Object.keys(agents)) {
+    const a = agents[id]
+    if (!a) continue
+    // Seed lastUpdatedAt for agents we havent seen before.
+    if (!lastUpdatedAt.has(id)) {
+      lastUpdatedAt.set(id, t0)
+      continue
+    }
+    const elapsed = t0 - lastUpdatedAt.get(id)
+    if (a.status === 'working' && elapsed >= opts.workingGapMs) {
+      updates.push(inferredUpdate(id, 'thinking', externalStatus[id]))
+    }
+    // Once applyExternalStatus changes the status to 'thinking', the working
+    // branch no longer matches on the next tick.
+  }
+  if (updates.length > 0) {
+    // Route through applyExternalStatus so the inferred state passes through
+    // the same pipeline as real hooks: behavior selection (decideBehavior with
+    // classifyStatus mapping COGNITION/GATE families), mood engine event, etc.
+    // The source marker tells downstream observers this was inferred.
+    state.applyExternalStatus(updates, {
+      source: 'idle-gap-infer',
+      // No mood event for inferred — we dont want classifyStatus 'thinking' to
+      // count toward rushing/frustrated/stuck patterns.
+      hasWorkflow: false,
+    })
+    // Reset clocks for the inferred agents so we dont immediately re-infer.
+    const t1 = opts.now()
+    for (const u of updates) lastUpdatedAt.set(u.agentId, t1)
+  }
+}
+
+/**
+ * Internal: stamp lastUpdatedAt whenever an agent's status or task changes.
+ * Subscribing to the FULL agents object would fire on every position tick
+ * (movementSystem mutates position 60 times per second). We track only the
+ * (status, task) signature.
+ */
+function computeSig(state) {
+  const agents = state?.agents
+  if (!agents) return ''
+  // AVO-173: `task` lives on externalStatus in production — the agents slice never carries it
+  // (store.js applyExternalStatus writes only status/behavior/expression). Read task from there so a
+  // tool change (Read→Grep with status staying 'working') resets the clock and we don't falsely infer
+  // 'thinking' on an actively tool-using agent. Fall back to agents[id].task for robustness/older tests.
+  const externalStatus = state?.externalStatus || {}
+  let sig = ''
+  for (const id of Object.keys(agents)) {
+    const a = agents[id]
+    const task = externalStatus[id]?.task ?? a?.task ?? ''
+    sig += `${id}:${a?.status ?? ''}:${task};`
+  }
+  return sig
+}
+
+function subscribeAgentUpdates(store, now = Date.now) {
+  // Initialize prevSig to the current state so the FIRST listener call
+  // only sees real diffs — without this, every agent in the initial roster
+  // would be treated as "newly added" and get stamped on the first store
+  // mutation, defeating the gap-detection logic.
+  let prevSig = computeSig(store.getState())
+  return store.subscribe((state) => {
+    const nextSig = computeSig(state)
+    if (nextSig === prevSig) return
+    // At least one agent's status/task changed. Diff which one and stamp.
+    // For simplicity we re-stamp all agents whose signature differs from
+    // before; the cost is O(n) per change which is fine for n ≤ ~20.
+    const prevMap = parseSig(prevSig)
+    const nextMap = parseSig(nextSig)
+    const t = now()
+    for (const [id, sig] of nextMap.entries()) {
+      if (prevMap.get(id) !== sig) lastUpdatedAt.set(id, t)
+    }
+    prevSig = nextSig
+  })
+}
+
+function parseSig(sig) {
+  const m = new Map()
+  if (!sig) return m
+  for (const part of sig.split(';')) {
+    if (!part) continue
+    const colonIdx = part.indexOf(':')
+    if (colonIdx <= 0) continue
+    m.set(part.slice(0, colonIdx), part.slice(colonIdx + 1))
+  }
+  return m
+}
+
+/**
+ * Start idle-gap inference. Returns a stop function that clears both
+ * the polling interval and the agent subscription.
+ *
+ * Options:
+ *   workingGapMs   — gap before inferring 'thinking' (default 45000)
+ *   intervalMs     — polling interval (default 10000)
+ *   now            — clock injector for deterministic tests (default Date.now)
+ */
+export function startIdleGapInference(store, options = {}) {
+  const opts = {
+    workingGapMs: options.workingGapMs ?? WORKING_GAP_MS,
+    intervalMs:   options.intervalMs   ?? POLL_INTERVAL_MS,
+    now:          options.now           ?? Date.now,
+  }
+  if (typeof store?.getState !== 'function' || typeof store?.subscribe !== 'function') {
+    return () => {}
+  }
+  if (typeof setInterval === 'undefined') {
+    return () => {}
+  }
+  const unsubscribe = subscribeAgentUpdates(store, opts.now)
+  // Seed lastUpdatedAt for all current agents so the very first tick doesnt
+  // immediately fire on the agents that have been sitting idle since app boot.
+  const t0 = opts.now()
+  const seed = store.getState().agents
+  if (seed) for (const id of Object.keys(seed)) lastUpdatedAt.set(id, t0)
+  const intervalId = setInterval(() => tick(store, opts, opts.now), opts.intervalMs)
+  return function stopIdleGapInference() {
+    if (typeof clearInterval !== 'undefined') clearInterval(intervalId)
+    if (typeof unsubscribe === 'function') unsubscribe()
+    // Prune Map entries for agents no longer present in the store so
+    // evicted/worktree agents don't accumulate across spawned instances (fix #3).
+    const currentAgents = store.getState?.()?.agents ?? {}
+    for (const agentId of lastUpdatedAt.keys()) {
+      if (!(agentId in currentAgents)) lastUpdatedAt.delete(agentId)
+    }
+  }
+}
+
+/** Test helper: wipe internal state. */
+export function _resetIdleGapState() {
+  lastUpdatedAt.clear()
+}
